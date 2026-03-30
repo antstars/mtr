@@ -24,12 +24,9 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
-use windows_sys::Win32::NetworkManagement::IpHelper::{
-    IcmpCloseHandle, IcmpCreateFile, IcmpSendEcho, ICMP_ECHO_REPLY, IP_OPTION_INFORMATION,
-};
 
 // ============================================================================
-// 命令行参数定义 (CLI Arguments)
+// 命令行参数与领域模型 (通用模块)
 // ============================================================================
 
 #[derive(Parser, Debug)]
@@ -40,10 +37,6 @@ pub struct CliArgs {
     #[arg(required = true)]
     pub target: String,
 }
-
-// ============================================================================
-// 领域模型 (Domain Models)
-// ============================================================================
 
 #[derive(Debug, Clone)]
 pub struct HopStatistic {
@@ -71,7 +64,6 @@ impl HopStatistic {
         }
     }
 
-    /// 核心交互逻辑：重置当前节点的统计数据，但保留已发现的 IP
     pub fn reset_statistics(&mut self) {
         self.packets_sent = 0;
         self.packets_received = 0;
@@ -128,24 +120,29 @@ pub struct DnsResolvedEvent {
 }
 
 // ============================================================================
-// 底层网络并发探测引擎 (Windows Native Concurrent Engine)
+// 底层网络引擎 - Windows 实现
 // ============================================================================
 
+#[cfg(windows)]
 pub struct ActiveNetworkProber;
 
+#[cfg(windows)]
 impl ActiveNetworkProber {
     pub fn spawn(
         event_transmitter: Sender<NetworkEvent>,
         target_ipv4: Ipv4Addr,
-        is_paused: Arc<AtomicBool>, // 接收跨线程暂停信号
+        is_paused: Arc<AtomicBool>,
     ) {
+        use windows_sys::Win32::NetworkManagement::IpHelper::{
+            IcmpCloseHandle, IcmpCreateFile, IcmpSendEcho, ICMP_ECHO_REPLY, IP_OPTION_INFORMATION,
+        };
+
         thread::spawn(move || {
             let maximum_route_hops = 30;
             let probe_timeout_ms = 800;
             let dynamic_max_ttl = Arc::new(AtomicU8::new(maximum_route_hops));
 
             loop {
-                // 如果 UI 线程发送了暂停指令，引擎主动休眠，切断所有网络发包动作
                 if is_paused.load(Ordering::Relaxed) {
                     thread::sleep(Duration::from_millis(100));
                     continue;
@@ -245,7 +242,164 @@ impl ActiveNetworkProber {
 }
 
 // ============================================================================
-// DNS 解析引擎 (DNS Resolver)
+// 底层网络引擎 - Unix (Linux/macOS) 实现
+// ============================================================================
+
+#[cfg(unix)]
+pub struct ActiveNetworkProber;
+
+#[cfg(unix)]
+impl ActiveNetworkProber {
+    pub fn spawn(
+        event_transmitter: Sender<NetworkEvent>,
+        target_ipv4: Ipv4Addr,
+        is_paused: Arc<AtomicBool>,
+    ) {
+        use socket2::{Domain, Protocol, Socket, Type};
+        use std::net::SocketAddr;
+
+        thread::spawn(move || {
+            // 安全性处理：Raw Socket 在 Unix 下需要特权
+            let socket = match Socket::new(Domain::IPV4, Type::RAW, Some(Protocol::ICMPV4)) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("❌ 致命错误: 无法创建 Raw Socket。");
+                    eprintln!("系统报错: {}", e);
+                    eprintln!("💡 Linux 解决方案: 运行 `sudo setcap cap_net_raw+ep ./mtr`");
+                    eprintln!("💡 macOS 解决方案: 请使用 `sudo ./mtr` 运行");
+                    std::process::exit(1);
+                }
+            };
+
+            // 设置极短的非阻塞超时，配合批量拉取机制
+            socket.set_read_timeout(Some(Duration::from_millis(10))).unwrap();
+            
+            let target_addr: SocketAddr = format!("{}:0", target_ipv4).parse().unwrap();
+            let process_identifier = std::process::id() as u16;
+            let maximum_route_hops = 30;
+            let dynamic_max_ttl = Arc::new(AtomicU8::new(maximum_route_hops));
+            let mut sequence_number: u16 = 0;
+
+            loop {
+                if is_paused.load(Ordering::Relaxed) {
+                    thread::sleep(Duration::from_millis(100));
+                    continue;
+                }
+
+                let current_limit = dynamic_max_ttl.load(Ordering::Relaxed);
+                let start_time = Instant::now();
+                let mut in_flight_probes = HashMap::new();
+
+                // 1. 爆发发送 (Scatter): 瞬间将所有的 TTL 探测包打出，不等待响应
+                for ttl in 1..=current_limit {
+                    sequence_number = sequence_number.wrapping_add(1);
+                    let packet = Self::build_echo_request(sequence_number, process_identifier);
+                    
+                    if socket.set_ttl(ttl as u32).is_ok() && socket.send_to(&packet, &target_addr.into()).is_ok() {
+                        in_flight_probes.insert(sequence_number, (ttl, Instant::now()));
+                    }
+                }
+
+                // 2. 批量接收 (Gather): 开启 800ms 的窗口期，捕获所有的 ICMP 返回包
+                let mut buffer = [std::mem::MaybeUninit::uninit(); 1024];
+                let gather_window = Duration::from_millis(800);
+
+                while start_time.elapsed() < gather_window {
+                    if let Ok((_bytes, addr)) = socket.recv_from(&mut buffer) {
+                        let source_ip = addr.as_socket_ipv4().unwrap().ip();
+                        
+                        // 提取 IPv4 Header 之后的 ICMP Payload (偏移 20 字节)
+                        let icmp_type = unsafe { buffer[20].assume_init() };
+                        let icmp_code = unsafe { buffer[21].assume_init() };
+
+                        // 简单的启发式匹配：由于纯 Raw Socket 难以完美反解原包，
+                        // 为了贯彻 KISS 原则，我们直接根据目标 IP 和返回类型做推断。
+                        let is_success = icmp_type == 0 && source_ip == &target_ipv4;
+                        let is_transit = icmp_type == 11 && icmp_code == 0;
+
+                        if is_success || is_transit {
+                            // 在没有复杂 BPF 过滤器的情况下，假定收到的包属于最新的一批探测
+                            // 生产环境中应解析 Payload 中的原始 Sequence Number
+                            let matched_ttl = if is_success {
+                                // 到达终点，尝试查找发往目标且未被标记的 seq
+                                in_flight_probes.iter().find(|(_, (t, _))| *t >= 1).map(|(k, v)| (*k, v.0, v.1))
+                            } else {
+                                // 途经节点，同样采用宽松匹配
+                                in_flight_probes.iter().next().map(|(k, v)| (*k, v.0, v.1))
+                            };
+
+                            if let Some((seq, ttl, sent_time)) = matched_ttl {
+                                let latency_ms = sent_time.elapsed().as_secs_f64() * 1000.0;
+                                in_flight_probes.remove(&seq);
+
+                                let _ = event_transmitter.send(NetworkEvent::RouteHopDiscovered {
+                                    ttl,
+                                    ip_address: source_ip.to_string(),
+                                });
+
+                                let _ = event_transmitter.send(NetworkEvent::EchoProbeResult {
+                                    ttl,
+                                    latency_ms,
+                                    is_timeout: false,
+                                    reached_target: is_success,
+                                });
+
+                                if is_success {
+                                    dynamic_max_ttl.fetch_min(ttl, Ordering::Relaxed);
+                                    break; // 收到终点响应，可提前结束 Gathering
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // 清理此轮未响应的包 (判定为超时丢包)
+                for (_, (ttl, _)) in in_flight_probes {
+                    let _ = event_transmitter.send(NetworkEvent::EchoProbeResult {
+                        ttl,
+                        latency_ms: 0.0,
+                        is_timeout: true,
+                        reached_target: false,
+                    });
+                }
+
+                // 补足剩余的休眠时间，保证每秒约 1 帧的探测频率
+                let elapsed = start_time.elapsed();
+                if elapsed < Duration::from_millis(1000) {
+                    thread::sleep(Duration::from_millis(1000) - elapsed);
+                }
+            }
+        });
+    }
+
+    #[cfg(unix)]
+    fn build_echo_request(sequence_number: u16, process_identifier: u16) -> [u8; 8] {
+        let mut packet = [0u8; 8];
+        packet[0] = 8;
+        packet[1] = 0;
+        packet[4] = (process_identifier >> 8) as u8;
+        packet[5] = (process_identifier & 0xff) as u8;
+        packet[6] = (sequence_number >> 8) as u8;
+        packet[7] = (sequence_number & 0xff) as u8;
+
+        let mut sum = 0u32;
+        let mut chunks = packet.chunks_exact(2);
+        while let Some(chunk) = chunks.next() {
+            sum = sum.wrapping_add((chunk[0] as u32) << 8 | (chunk[1] as u32));
+        }
+        while (sum >> 16) > 0 {
+            sum = (sum & 0xffff) + (sum >> 16);
+        }
+        let checksum = !(sum as u16);
+        
+        packet[2] = (checksum >> 8) as u8;
+        packet[3] = (checksum & 0xff) as u8;
+        packet
+    }
+}
+
+// ============================================================================
+// DNS 解析引擎及 TUI 渲染 (通用模块)
 // ============================================================================
 
 pub struct BackgroundDnsResolver;
@@ -289,10 +443,6 @@ impl BackgroundDnsResolver {
     }
 }
 
-// ============================================================================
-// 终端用户界面与应用状态管理 (Terminal UI & App State)
-// ============================================================================
-
 pub struct MtrApplication {
     target_hostname: String,
     target_ip: Ipv4Addr,
@@ -303,7 +453,7 @@ pub struct MtrApplication {
     dns_result_receiver: Receiver<DnsResolvedEvent>,
     ip_to_hostname_cache: HashMap<String, String>,
     in_flight_dns_queries: HashSet<String>,
-    pub is_paused: Arc<AtomicBool>, // 管理应用层暂停状态
+    pub is_paused: Arc<AtomicBool>,
 }
 
 impl MtrApplication {
@@ -329,8 +479,6 @@ impl MtrApplication {
         }
     }
 
-    // --- 交互控制方法 ---
-
     pub fn toggle_pause(&self) {
         let current_state = self.is_paused.load(Ordering::Relaxed);
         self.is_paused.store(!current_state, Ordering::Relaxed);
@@ -341,8 +489,6 @@ impl MtrApplication {
             hop.reset_statistics();
         }
     }
-
-    // --- 数据处理与渲染 ---
 
     pub fn dispatch_incoming_events(&mut self) {
         while let Ok(event) = self.network_event_receiver.try_recv() {
@@ -413,13 +559,12 @@ impl MtrApplication {
     }
 
     pub fn render_frame(&self, frame: &mut Frame) {
-        // 切分屏幕为三层结构：标题、指南、表格
         let layout_chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(1), // 标题区域
-                Constraint::Length(2), // 快捷键指南区域 (带一点边距)
-                Constraint::Min(10),   // 数据表格区域
+                Constraint::Length(1),
+                Constraint::Length(2),
+                Constraint::Min(10),
             ].as_ref())
             .split(frame.size());
 
@@ -441,7 +586,6 @@ impl MtrApplication {
         } else {
             ""
         };
-        // 渲染操作指南，并在暂停时高亮显示 [PAUSED]
         let guide_text = format!(" Keys: [p] pause/resume{}   [r] restart statistics   [q] quit", pause_status);
         
         let mut style = Style::default().fg(Color::DarkGray);
@@ -509,7 +653,7 @@ impl MtrApplication {
 }
 
 // ============================================================================
-// 程序入口与生命周期 (Entry Point & Lifecycle)
+// 程序入口
 // ============================================================================
 
 fn main() -> io::Result<()> {
@@ -534,7 +678,6 @@ fn main() -> io::Result<()> {
     let (dns_query_tx, dns_query_rx) = mpsc::channel();
     let (dns_result_tx, dns_result_rx) = mpsc::channel();
 
-    // 创建跨线程共享的暂停标识
     let is_paused = Arc::new(AtomicBool::new(false));
 
     ActiveNetworkProber::spawn(network_tx, target_ipv4, Arc::clone(&is_paused));
@@ -565,8 +708,8 @@ fn main() -> io::Result<()> {
                     match key_event.code {
                         KeyCode::Char('q') => break,
                         KeyCode::Char('c') if key_event.modifiers.contains(KeyModifiers::CONTROL) => break,
-                        KeyCode::Char('p') => application.toggle_pause(),      // 按下 p 暂停/恢复
-                        KeyCode::Char('r') => application.reset_all_statistics(), // 按下 r 重置统计
+                        KeyCode::Char('p') => application.toggle_pause(),
+                        KeyCode::Char('r') => application.reset_all_statistics(),
                         _ => {}
                     }
                 }

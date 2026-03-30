@@ -26,7 +26,7 @@ use std::{
 };
 
 // ============================================================================
-// 命令行参数与领域模型 (通用模块)
+// 领域模型与核心数据结构
 // ============================================================================
 
 #[derive(Parser, Debug)]
@@ -201,7 +201,7 @@ impl ActiveNetworkProber {
                                 }
 
                                 let is_success = status_code == 0;
-                                let is_transit = status_code == 11013;
+                                let is_transit = status_code == 11013; // IP_TTL_EXPIRED_TRANSIT
                                 let reached_target = is_success && router_ipv4 == target_ip;
 
                                 if is_success || is_transit {
@@ -246,6 +246,19 @@ impl ActiveNetworkProber {
 // ============================================================================
 
 #[cfg(unix)]
+enum IcmpResponseType {
+    EchoReply,
+    TimeExceeded,
+}
+
+#[cfg(unix)]
+struct IcmpMatchMetadata {
+    pub response_type: IcmpResponseType,
+    pub process_identifier: u16,
+    pub sequence_number: u16,
+}
+
+#[cfg(unix)]
 pub struct ActiveNetworkProber;
 
 #[cfg(unix)]
@@ -259,7 +272,6 @@ impl ActiveNetworkProber {
         use std::net::SocketAddr;
 
         thread::spawn(move || {
-            // 安全性处理：Raw Socket 在 Unix 下需要特权
             let socket = match Socket::new(Domain::IPV4, Type::RAW, Some(Protocol::ICMPV4)) {
                 Ok(s) => s,
                 Err(e) => {
@@ -271,10 +283,10 @@ impl ActiveNetworkProber {
                 }
             };
 
-            // 设置极短的非阻塞超时，配合批量拉取机制
-            socket.set_read_timeout(Some(Duration::from_millis(10))).unwrap();
+            socket.set_read_timeout(Some(Duration::from_millis(10))).expect("Failed to set socket timeout");
             
-            let target_addr: SocketAddr = format!("{}:0", target_ipv4).parse().unwrap();
+            // 安全构造目标地址，消除毫无意义的 string parsing 开销
+            let target_addr = SocketAddr::from((target_ipv4, 0));
             let process_identifier = std::process::id() as u16;
             let maximum_route_hops = 30;
             let dynamic_max_ttl = Arc::new(AtomicU8::new(maximum_route_hops));
@@ -290,7 +302,7 @@ impl ActiveNetworkProber {
                 let start_time = Instant::now();
                 let mut in_flight_probes = HashMap::new();
 
-                // 1. 爆发发送 (Scatter): 瞬间将所有的 TTL 探测包打出，不等待响应
+                // 1. 发射探测包 (Scatter Phase)
                 for ttl in 1..=current_limit {
                     sequence_number = sequence_number.wrapping_add(1);
                     let packet = Self::build_echo_request(sequence_number, process_identifier);
@@ -300,37 +312,34 @@ impl ActiveNetworkProber {
                     }
                 }
 
-                // 2. 批量接收 (Gather): 开启 800ms 的窗口期，捕获所有的 ICMP 返回包
+                // 2. 收集响应报文 (Gather Phase)
                 let mut buffer = [std::mem::MaybeUninit::uninit(); 1024];
                 let gather_window = Duration::from_millis(800);
 
                 while start_time.elapsed() < gather_window {
-                    if let Ok((_bytes, addr)) = socket.recv_from(&mut buffer) {
-                        let source_ip = addr.as_socket_ipv4().unwrap().ip();
+                    if let Ok((bytes_read, addr)) = socket.recv_from(&mut buffer) {
+                        // 防御 1: 忽略非 IPv4 地址，杜绝直接 unwrap 导致进程崩溃
+                        let source_ip = match addr.as_socket_ipv4() {
+                            Some(v4) => *v4.ip(),
+                            None => continue,
+                        };
                         
-                        // 提取 IPv4 Header 之后的 ICMP Payload (偏移 20 字节)
-                        let icmp_type = unsafe { buffer[20].assume_init() };
-                        let icmp_code = unsafe { buffer[21].assume_init() };
+                        // 防御 2: 安全构建初始化后的内存切片
+                        let packet_data: &[u8] = unsafe {
+                            std::slice::from_raw_parts(buffer.as_ptr() as *const u8, bytes_read)
+                        };
 
-                        // 简单的启发式匹配：由于纯 Raw Socket 难以完美反解原包，
-                        // 为了贯彻 KISS 原则，我们直接根据目标 IP 和返回类型做推断。
-                        let is_success = icmp_type == 0 && source_ip == &target_ipv4;
-                        let is_transit = icmp_type == 11 && icmp_code == 0;
+                        // 3. 将字节流转换为结构化的元数据，剥离了底层的危险偏移量操作
+                        if let Some(metadata) = Self::extract_probe_metadata(packet_data) {
+                            // 校验 1: 此报文是否属于当前 mtr 进程发出的探测
+                            if metadata.process_identifier != process_identifier {
+                                continue;
+                            }
 
-                        if is_success || is_transit {
-                            // 在没有复杂 BPF 过滤器的情况下，假定收到的包属于最新的一批探测
-                            // 生产环境中应解析 Payload 中的原始 Sequence Number
-                            let matched_ttl = if is_success {
-                                // 到达终点，尝试查找发往目标且未被标记的 seq
-                                in_flight_probes.iter().find(|(_, (t, _))| *t >= 1).map(|(k, v)| (*k, v.0, v.1))
-                            } else {
-                                // 途经节点，同样采用宽松匹配
-                                in_flight_probes.iter().next().map(|(k, v)| (*k, v.0, v.1))
-                            };
-
-                            if let Some((seq, ttl, sent_time)) = matched_ttl {
+                            // 校验 2: 基于精确的 Sequence Number 提取对应的发送记录
+                            if let Some((ttl, sent_time)) = in_flight_probes.remove(&metadata.sequence_number) {
                                 let latency_ms = sent_time.elapsed().as_secs_f64() * 1000.0;
-                                in_flight_probes.remove(&seq);
+                                let is_success = matches!(metadata.response_type, IcmpResponseType::EchoReply);
 
                                 let _ = event_transmitter.send(NetworkEvent::RouteHopDiscovered {
                                     ttl,
@@ -346,14 +355,14 @@ impl ActiveNetworkProber {
 
                                 if is_success {
                                     dynamic_max_ttl.fetch_min(ttl, Ordering::Relaxed);
-                                    break; // 收到终点响应，可提前结束 Gathering
+                                    break; // 已到达终点，可提前终止当前 Gather 循环
                                 }
                             }
                         }
                     }
                 }
 
-                // 清理此轮未响应的包 (判定为超时丢包)
+                // 3. 清理超时探测包 (Timeout Handling Phase)
                 for (_, (ttl, _)) in in_flight_probes {
                     let _ = event_transmitter.send(NetworkEvent::EchoProbeResult {
                         ttl,
@@ -363,7 +372,7 @@ impl ActiveNetworkProber {
                     });
                 }
 
-                // 补足剩余的休眠时间，保证每秒约 1 帧的探测频率
+                // 补偿休眠时间，维持整体每秒发送一轮探测的频率
                 let elapsed = start_time.elapsed();
                 if elapsed < Duration::from_millis(1000) {
                     thread::sleep(Duration::from_millis(1000) - elapsed);
@@ -372,16 +381,77 @@ impl ActiveNetworkProber {
         });
     }
 
+    /// 安全、防御性地解析网络报文，提取匹配所需的关键元数据
+    /// 
+    /// 职责：严格管理内存边界，解析不同类型的 ICMP 协议结构。如果发现数据包残缺或格式错误，
+    /// 立即返回 None 以阻止后续处理。
+    #[cfg(unix)]
+    fn extract_probe_metadata(packet_data: &[u8]) -> Option<IcmpMatchMetadata> {
+        // --- 剥离外层 IP Header ---
+        if packet_data.is_empty() { return None; }
+        // IPv4 头部第一个字节低 4 位为 IHL (Internet Header Length)
+        let outer_ihl = (packet_data[0] & 0x0F) as usize;
+        let outer_ip_header_length = outer_ihl * 4;
+
+        // 校验：确保数据包长度足够容纳外层 IP 头和至少 8 字节的外层 ICMP 头
+        if packet_data.len() < outer_ip_header_length + 8 { return None; }
+
+        let icmp_type = packet_data[outer_ip_header_length];
+
+        match icmp_type {
+            0 => { 
+                // Type 0: Echo Reply (终点响应)
+                let identifier = u16::from_be_bytes([packet_data[outer_ip_header_length + 4], packet_data[outer_ip_header_length + 5]]);
+                let sequence_number = u16::from_be_bytes([packet_data[outer_ip_header_length + 6], packet_data[outer_ip_header_length + 7]]);
+                
+                Some(IcmpMatchMetadata {
+                    response_type: IcmpResponseType::EchoReply,
+                    process_identifier: identifier,
+                    sequence_number,
+                })
+            }
+            11 => { 
+                // Type 11: Time Exceeded (途经路由器丢弃)
+                // 在 Time Exceeded 的 Payload 中，封装了触发此错误的原始 IP Header 和 ICMP Header
+                let inner_ip_offset = outer_ip_header_length + 8;
+                if packet_data.len() <= inner_ip_offset { return None; }
+
+                // 解析被内嵌的原始 IP Header
+                let inner_ihl = (packet_data[inner_ip_offset] & 0x0F) as usize;
+                let inner_ip_header_length = inner_ihl * 4;
+                let inner_icmp_offset = inner_ip_offset + inner_ip_header_length;
+
+                // 校验：确保能完整读出内嵌的原始 ICMP 头部的前 8 个字节
+                if packet_data.len() < inner_icmp_offset + 8 { return None; }
+
+                // 校验：确认原始协议确实是 ICMP (协议号 1 在 IP Header 偏移量 9 的位置)
+                if packet_data[inner_ip_offset + 9] != 1 { return None; }
+
+                // 提取原始探测包的 Identifier 和 Sequence Number
+                let identifier = u16::from_be_bytes([packet_data[inner_icmp_offset + 4], packet_data[inner_icmp_offset + 5]]);
+                let sequence_number = u16::from_be_bytes([packet_data[inner_icmp_offset + 6], packet_data[inner_icmp_offset + 7]]);
+
+                Some(IcmpMatchMetadata {
+                    response_type: IcmpResponseType::TimeExceeded,
+                    process_identifier: identifier,
+                    sequence_number,
+                })
+            }
+            _ => None // 忽略其他非探测相关的 ICMP 类型
+        }
+    }
+
     #[cfg(unix)]
     fn build_echo_request(sequence_number: u16, process_identifier: u16) -> [u8; 8] {
         let mut packet = [0u8; 8];
-        packet[0] = 8;
-        packet[1] = 0;
+        packet[0] = 8; // Type: Echo Request
+        packet[1] = 0; // Code: 0
         packet[4] = (process_identifier >> 8) as u8;
         packet[5] = (process_identifier & 0xff) as u8;
         packet[6] = (sequence_number >> 8) as u8;
         packet[7] = (sequence_number & 0xff) as u8;
 
+        // 计算 ICMP Checksum
         let mut sum = 0u32;
         let mut chunks = packet.chunks_exact(2);
         while let Some(chunk) = chunks.next() {
@@ -399,7 +469,7 @@ impl ActiveNetworkProber {
 }
 
 // ============================================================================
-// DNS 解析引擎及 TUI 渲染 (通用模块)
+// DNS 解析引擎及 TUI 渲染模块
 // ============================================================================
 
 pub struct BackgroundDnsResolver;

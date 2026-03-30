@@ -4,14 +4,14 @@
 
 set -e
 
-echo "🚀 开始构建工业级 Rust MTR..."
+echo "🚀 开始构建 Rust MTR..."
 cargo build --release
 
 BIN_PATH="./target/release/mtr"
-DEST_PATH="/usr/local/bin/rust-mtr"
+DEST_PATH="/usr/local/bin/mtr"
 
 echo "📦 正在将二进制文件安装到 $DEST_PATH..."
-sudo cp "$BIN_PATH" "$DEST_PATH"
+sudo cp -rf "$BIN_PATH" "$DEST_PATH"
 
 # 尝试使用现代的 Capabilities 方案
 if command -v setcap >/dev/null 2>&1; then
@@ -26,4 +26,4 @@ else
     echo "✅ 部署完成！(模式: SUID)"
 fi
 
-echo "🎉 一切就绪！现在你可以直接执行: rust-mtr <域名或IP>"
+echo "🎉 一切就绪！现在你可以直接执行: mtr <域名或IP>"

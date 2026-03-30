@@ -61,7 +61,6 @@ mtr 39.156.66.10
 
 ## 🛠️ 技术架构与设计原则
 
-
 本项目严格遵循高级软件工程与系统级安全规范：
 
 * **SOLID & SRP** ：UI 渲染层、后台 DNS 解析层与并发网络探测引擎（基于 `mpsc::channel` 通信）完全解耦，职责边界清晰。
@@ -72,4 +71,4 @@ mtr 39.156.66.10
 
 ## 📄 开源协议
 
-本项目基于 [MIT License](https://www.google.com/search?q=LICENSE&authuser=2) 协议开源。
+本项目基于 [MIT License](https://github.com/antstars/mtr?tab=MIT-1-ov-file#) 协议开源。

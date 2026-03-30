@@ -1,0 +1,104 @@
+name: Release Build
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build for ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            use_cross: true
+            bin_name: mtr
+            asset_name: mtr-linux-amd64
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+            use_cross: true
+            bin_name: mtr
+            asset_name: mtr-linux-arm64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            use_cross: false
+            bin_name: mtr.exe
+            asset_name: mtr-windows-amd64.exe
+          - os: windows-latest
+            target: aarch64-pc-windows-msvc
+            use_cross: false
+            bin_name: mtr.exe
+            asset_name: mtr-windows-arm64.exe
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            use_cross: false
+            bin_name: mtr
+            asset_name: mtr-macos-intel
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            use_cross: false
+            bin_name: mtr
+            asset_name: mtr-macos-arm64
+          # --- iOS 真机 (ARM64) ---
+          - os: macos-latest
+            target: aarch64-apple-ios
+            use_cross: false
+            bin_name: mtr
+            asset_name: mtr-ios-arm64
+          # --- iOS 模拟器 (Apple Silicon架构) ---
+          - os: macos-latest
+            target: aarch64-apple-ios-sim
+            use_cross: false
+            bin_name: mtr
+            asset_name: mtr-ios-sim-arm64
+          # --- iOS 模拟器 (旧版 Intel 架构) ---
+          - os: macos-latest
+            target: x86_64-apple-ios
+            use_cross: false
+            bin_name: mtr
+            asset_name: mtr-ios-sim-intel
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross (Linux only)
+        if: matrix.use_cross == true
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+
+      - name: Build with cross
+        if: matrix.use_cross == true
+        run: cross build --release --target ${{ matrix.target }}
+
+      - name: Build with cargo
+        if: matrix.use_cross == false
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Rename artifact
+        shell: bash
+        run: |
+          cd target/${{ matrix.target }}/release
+          mv ${{ matrix.bin_name }} ${{ matrix.asset_name }}
+
+      - name: Upload Release Asset
+        uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: target/${{ matrix.target }}/release/${{ matrix.asset_name }}

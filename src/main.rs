@@ -21,14 +21,44 @@ use std::{
         mpsc::{self, Receiver, Sender},
         Arc,
     },
-    thread,
+    thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
 
 // ============================================================================
+// 终端会话守卫 (RAII)
+// 为什么：防止进程在发生 Panic 或中途异常退出时，使得用户的终端界面卡死或排版错乱
+// ============================================================================
+struct TerminalSession {
+    terminal: Terminal<CrosstermBackend<io::Stdout>>,
+}
+
+impl TerminalSession {
+    fn enter() -> io::Result<Self> {
+        enable_raw_mode()?;
+        let mut standard_output = io::stdout();
+        execute!(standard_output, EnterAlternateScreen)?;
+        let tui_backend = CrosstermBackend::new(standard_output);
+        let terminal = Terminal::new(tui_backend)?;
+        Ok(Self { terminal })
+    }
+
+    fn terminal_mut(&mut self) -> &mut Terminal<CrosstermBackend<io::Stdout>> {
+        &mut self.terminal
+    }
+}
+
+impl Drop for TerminalSession {
+    fn drop(&mut self) {
+        let _ = disable_raw_mode();
+        let _ = execute!(self.terminal.backend_mut(), LeaveAlternateScreen);
+        let _ = self.terminal.show_cursor();
+    }
+}
+
+// ============================================================================
 // 领域模型与核心数据结构
 // ============================================================================
-
 #[derive(Parser, Debug)]
 #[command(name = "Rust MTR")]
 #[command(version)]
@@ -41,90 +71,122 @@ pub struct CliArgs {
 #[derive(Debug, Clone)]
 pub struct HopStatistic {
     pub ttl: u8,
-    pub ip_address: String,
+    pub ip_address: Option<Ipv4Addr>,
     pub packets_sent: u32,
     pub packets_received: u32,
-    pub last_latency_ms: f64,
-    pub best_latency_ms: f64,
-    pub worst_latency_ms: f64,
-    pub total_latency_ms: f64,
+    pub last_latency_ms: Option<f64>,
+    pub best_latency_ms: Option<f64>,
+    pub worst_latency_ms: Option<f64>,
+    pub mean_latency_ms: f64,
+    pub m2_latency_ms: f64,
 }
 
 impl HopStatistic {
-    pub fn new(ttl: u8, ip_address: String) -> Self {
+    pub fn new(ttl: u8, ip_address: Option<Ipv4Addr>) -> Self {
         Self {
             ttl,
             ip_address,
             packets_sent: 0,
             packets_received: 0,
-            last_latency_ms: 0.0,
-            best_latency_ms: f64::MAX,
-            worst_latency_ms: 0.0,
-            total_latency_ms: 0.0,
+            last_latency_ms: None,
+            best_latency_ms: None,
+            worst_latency_ms: None,
+            mean_latency_ms: 0.0,
+            m2_latency_ms: 0.0,
         }
     }
 
     pub fn reset_statistics(&mut self) {
         self.packets_sent = 0;
         self.packets_received = 0;
-        self.last_latency_ms = 0.0;
-        self.best_latency_ms = f64::MAX;
-        self.worst_latency_ms = 0.0;
-        self.total_latency_ms = 0.0;
+        self.last_latency_ms = None;
+        self.best_latency_ms = None;
+        self.worst_latency_ms = None;
+        self.mean_latency_ms = 0.0;
+        self.m2_latency_ms = 0.0;
     }
 
     pub fn packet_loss_percentage(&self) -> f64 {
         if self.packets_sent == 0 {
             return 0.0;
         }
-        let lost = self.packets_sent.saturating_sub(self.packets_received);
-        (lost as f64 / self.packets_sent as f64) * 100.0
+        let lost_packets = self.packets_sent.saturating_sub(self.packets_received);
+        (lost_packets as f64 / self.packets_sent as f64) * 100.0
     }
 
-    pub fn average_latency_ms(&self) -> f64 {
+    pub fn average_latency_ms(&self) -> Option<f64> {
         if self.packets_received == 0 {
-            return 0.0;
+            return None;
         }
-        self.total_latency_ms / self.packets_received as f64
+        Some(self.mean_latency_ms)
     }
 
-    pub fn standard_deviation(&self) -> f64 {
+    pub fn standard_deviation(&self) -> Option<f64> {
         if self.packets_received < 2 {
-            return 0.0;
+            return None;
         }
-        let avg = self.average_latency_ms();
-        let variance = ((self.last_latency_ms - avg).powi(2)
-            + (self.best_latency_ms - avg).powi(2)
-            + (self.worst_latency_ms - avg).powi(2))
-            / 3.0;
-        variance.sqrt()
+        let variance = self.m2_latency_ms / ((self.packets_received - 1) as f64);
+        Some(variance.sqrt())
+    }
+
+    pub fn record_probe_result(&mut self, latency_ms: Option<f64>) {
+        self.packets_sent = self.packets_sent.saturating_add(1);
+
+        if let Some(latency_value_ms) = latency_ms {
+            self.packets_received = self.packets_received.saturating_add(1);
+            self.last_latency_ms = Some(latency_value_ms);
+
+            self.best_latency_ms = Some(match self.best_latency_ms {
+                Some(current_best_ms) => current_best_ms.min(latency_value_ms),
+                None => latency_value_ms,
+            });
+
+            self.worst_latency_ms = Some(match self.worst_latency_ms {
+                Some(current_worst_ms) => current_worst_ms.max(latency_value_ms),
+                None => latency_value_ms,
+            });
+
+            // 为什么：使用 Welford 在线算法，避免 IEEE 754 浮点数在计算平方和差值时发生灾难性取消
+            let delta = latency_value_ms - self.mean_latency_ms;
+            self.mean_latency_ms += delta / (self.packets_received as f64);
+            let delta2 = latency_value_ms - self.mean_latency_ms;
+            self.m2_latency_ms += delta * delta2;
+        }
     }
 }
 
 pub enum NetworkEvent {
     RouteHopDiscovered {
         ttl: u8,
-        ip_address: String,
+        ip_address: Ipv4Addr,
     },
     EchoProbeResult {
         ttl: u8,
-        latency_ms: f64,
-        is_timeout: bool,
+        latency_ms: Option<f64>,
         reached_target: bool,
     },
 }
 
 pub struct DnsResolvedEvent {
-    pub original_ip: String,
+    pub original_ip: Ipv4Addr,
     pub resolved_hostname: String,
 }
 
 // ============================================================================
-// 底层网络引擎 - Windows 实现
+// 底层网络引擎 - Windows 实现（常驻 1-to-1 线程矩阵）
+// 为什么：IcmpSendEcho 是阻塞调用，若共用少量的线程池，当遇到多个禁 Ping 节点时会引发
+// 管线阻塞 (Pipeline Stall)，导致整体探测周期从 1 秒被拉长至数秒。
 // ============================================================================
-
 #[cfg(windows)]
 pub struct ActiveNetworkProber;
+
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy)]
+struct WindowsProbeTask {
+    ttl: u8,
+    target_ipv4: Ipv4Addr,
+    probe_timeout_ms: u32,
+}
 
 #[cfg(windows)]
 impl ActiveNetworkProber {
@@ -132,17 +194,36 @@ impl ActiveNetworkProber {
         event_transmitter: Sender<NetworkEvent>,
         target_ipv4: Ipv4Addr,
         is_paused: Arc<AtomicBool>,
-    ) {
-        use windows_sys::Win32::NetworkManagement::IpHelper::{
-            IcmpCloseHandle, IcmpCreateFile, IcmpSendEcho, ICMP_ECHO_REPLY, IP_OPTION_INFORMATION,
-        };
-
+        should_exit: Arc<AtomicBool>,
+    ) -> JoinHandle<()> {
         thread::spawn(move || {
-            let maximum_route_hops = 30;
-            let probe_timeout_ms = 800;
+            let maximum_route_hops: u8 = 30;
+            let probe_timeout_ms: u32 = 800;
             let dynamic_max_ttl = Arc::new(AtomicU8::new(maximum_route_hops));
 
-            loop {
+            let mut ttl_senders: Vec<Sender<WindowsProbeTask>> = Vec::with_capacity(maximum_route_hops as usize);
+            let mut worker_join_handles: Vec<JoinHandle<()>> = Vec::with_capacity(maximum_route_hops as usize);
+
+            for _ in 0..maximum_route_hops {
+                let (task_sender, task_receiver) = mpsc::channel::<WindowsProbeTask>();
+                ttl_senders.push(task_sender);
+
+                let worker_event_transmitter = event_transmitter.clone();
+                let worker_should_exit = Arc::clone(&should_exit);
+                let worker_dynamic_max_ttl = Arc::clone(&dynamic_max_ttl);
+
+                let join_handle = thread::spawn(move || {
+                    Self::run_windows_probe_worker(
+                        task_receiver,
+                        worker_event_transmitter,
+                        worker_dynamic_max_ttl,
+                        worker_should_exit,
+                    );
+                });
+                worker_join_handles.push(join_handle);
+            }
+
+            while !should_exit.load(Ordering::Relaxed) {
                 if is_paused.load(Ordering::Relaxed) {
                     thread::sleep(Duration::from_millis(100));
                     continue;
@@ -150,103 +231,137 @@ impl ActiveNetworkProber {
 
                 let current_limit = dynamic_max_ttl.load(Ordering::Relaxed);
 
-                // Scatter: 并发发射探针，消除中间节点超时导致的阻塞
                 for ttl in 1..=current_limit {
-                    let tx = event_transmitter.clone();
-                    let target_ip = target_ipv4;
-                    let shared_limit = Arc::clone(&dynamic_max_ttl);
+                    if should_exit.load(Ordering::Relaxed) {
+                        break;
+                    }
 
-                    thread::spawn(move || {
-                        unsafe {
-                            let icmp_handle = IcmpCreateFile();
-                            if icmp_handle == 0 || icmp_handle == -1 {
-                                return;
-                            }
+                    let probe_task = WindowsProbeTask {
+                        ttl,
+                        target_ipv4,
+                        probe_timeout_ms,
+                    };
 
-                            let destination_address: u32 = u32::from_ne_bytes(target_ip.octets());
-                            let probe_payload = b"RUST_MTR_PROBE";
-                            let reply_buffer_size = 1024;
-                            let mut reply_buffer = vec![0u8; reply_buffer_size];
+                    let worker_index = (ttl - 1) as usize;
+                    let _ = ttl_senders[worker_index].send(probe_task);
+                }
 
-                            let ip_options = IP_OPTION_INFORMATION {
-                                Ttl: ttl as u8,
-                                Tos: 0,
-                                Flags: 0,
-                                OptionsSize: 0,
-                                OptionsData: std::ptr::null_mut(),
-                            };
+                let sleep_start_time = Instant::now();
+                while sleep_start_time.elapsed() < Duration::from_millis(1000) {
+                    if should_exit.load(Ordering::Relaxed) || is_paused.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(50));
+                }
+            }
 
-                            let ret_val = IcmpSendEcho(
-                                icmp_handle,
-                                destination_address,
-                                probe_payload.as_ptr() as _,
-                                probe_payload.len() as u16,
-                                &ip_options,
-                                reply_buffer.as_mut_ptr() as _,
-                                reply_buffer_size as u32,
-                                probe_timeout_ms,
-                            );
+            drop(ttl_senders);
+            for join_handle in worker_join_handles {
+                let _ = join_handle.join();
+            }
+        })
+    }
 
-                            if ret_val > 0 {
-                                let icmp_reply = &*(reply_buffer.as_ptr() as *const ICMP_ECHO_REPLY);
-                                let router_ipv4 = Ipv4Addr::from(icmp_reply.Address.to_ne_bytes());
-                                let router_ip_str = router_ipv4.to_string();
-                                let latency_ms = icmp_reply.RoundTripTime as f64;
-                                let status_code = icmp_reply.Status;
+    fn run_windows_probe_worker(
+        task_receiver: Receiver<WindowsProbeTask>,
+        event_transmitter: Sender<NetworkEvent>,
+        dynamic_max_ttl: Arc<AtomicU8>,
+        should_exit: Arc<AtomicBool>,
+    ) {
+        use windows_sys::Win32::NetworkManagement::IpHelper::{
+            IcmpCloseHandle, IcmpCreateFile, IcmpSendEcho, ICMP_ECHO_REPLY, IP_OPTION_INFORMATION,
+        };
 
-                                if icmp_reply.Address != 0 {
-                                    let _ = tx.send(NetworkEvent::RouteHopDiscovered {
-                                        ttl: ttl as u8,
-                                        ip_address: router_ip_str,
-                                    });
-                                }
+        const IP_TTL_EXPIRED_TRANSIT_STATUS: u32 = 11013;
 
-                                let is_success = status_code == 0;
-                                let is_transit = status_code == 11013; // IP_TTL_EXPIRED_TRANSIT
-                                let reached_target = is_success && router_ipv4 == target_ip;
+        while !should_exit.load(Ordering::Relaxed) {
+            let probe_task = match task_receiver.recv_timeout(Duration::from_millis(100)) {
+                Ok(task) => task,
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            };
 
-                                if is_success || is_transit {
-                                    let _ = tx.send(NetworkEvent::EchoProbeResult {
-                                        ttl: ttl as u8,
-                                        latency_ms,
-                                        is_timeout: false,
-                                        reached_target,
-                                    });
+            unsafe {
+                let icmp_handle = IcmpCreateFile();
+                if icmp_handle == 0 || icmp_handle == (-1isize) as _ {
+                    continue;
+                }
 
-                                    if reached_target {
-                                        shared_limit.fetch_min(ttl as u8, Ordering::Relaxed);
-                                    }
-                                } else {
-                                    let _ = tx.send(NetworkEvent::EchoProbeResult {
-                                        ttl: ttl as u8,
-                                        latency_ms: 0.0,
-                                        is_timeout: true,
-                                        reached_target: false,
-                                    });
-                                }
-                            } else {
-                                let _ = tx.send(NetworkEvent::EchoProbeResult {
-                                    ttl: ttl as u8,
-                                    latency_ms: 0.0,
-                                    is_timeout: true,
-                                    reached_target: false,
-                                });
-                            }
-                            // 必须释放内核句柄，防止高频并发下的资源泄漏
-                            IcmpCloseHandle(icmp_handle);
+                let destination_address = u32::from_ne_bytes(probe_task.target_ipv4.octets());
+                let probe_payload = b"RUST_MTR_PROBE";
+                let reply_buffer_size: usize = 1024;
+                let mut reply_buffer = vec![0u8; reply_buffer_size];
+
+                let ip_options = IP_OPTION_INFORMATION {
+                    Ttl: probe_task.ttl,
+                    Tos: 0,
+                    Flags: 0,
+                    OptionsSize: 0,
+                    OptionsData: std::ptr::null_mut(),
+                };
+
+                let result_count = IcmpSendEcho(
+                    icmp_handle,
+                    destination_address,
+                    probe_payload.as_ptr() as _,
+                    probe_payload.len() as u16,
+                    &ip_options,
+                    reply_buffer.as_mut_ptr() as _,
+                    reply_buffer_size as u32,
+                    probe_task.probe_timeout_ms,
+                );
+
+                if result_count > 0 {
+                    let icmp_reply = &*(reply_buffer.as_ptr() as *const ICMP_ECHO_REPLY);
+                    let router_ipv4 = Ipv4Addr::from(icmp_reply.Address.to_ne_bytes());
+                    let latency_ms = icmp_reply.RoundTripTime as f64;
+                    let status_code = icmp_reply.Status;
+
+                    if icmp_reply.Address != 0 {
+                        let _ = event_transmitter.send(NetworkEvent::RouteHopDiscovered {
+                            ttl: probe_task.ttl,
+                            ip_address: router_ipv4,
+                        });
+                    }
+
+                    let is_success = status_code == 0;
+                    let is_transit = status_code == IP_TTL_EXPIRED_TRANSIT_STATUS;
+                    let reached_target = is_success && router_ipv4 == probe_task.target_ipv4;
+
+                    if is_success || is_transit {
+                        let _ = event_transmitter.send(NetworkEvent::EchoProbeResult {
+                            ttl: probe_task.ttl,
+                            latency_ms: Some(latency_ms),
+                            reached_target,
+                        });
+
+                        if reached_target {
+                            dynamic_max_ttl.fetch_min(probe_task.ttl, Ordering::Relaxed);
                         }
+                    } else {
+                        let _ = event_transmitter.send(NetworkEvent::EchoProbeResult {
+                            ttl: probe_task.ttl,
+                            latency_ms: None,
+                            reached_target: false,
+                        });
+                    }
+                } else {
+                    let _ = event_transmitter.send(NetworkEvent::EchoProbeResult {
+                        ttl: probe_task.ttl,
+                        latency_ms: None,
+                        reached_target: false,
                     });
                 }
-                thread::sleep(Duration::from_millis(1000));
+
+                IcmpCloseHandle(icmp_handle);
             }
-        });
+        }
     }
 }
 
 // ============================================================================
 // 底层网络引擎 - Unix (Linux/macOS) 实现
 // ============================================================================
-
 #[cfg(unix)]
 enum IcmpResponseType {
     EchoReply,
@@ -269,31 +384,36 @@ impl ActiveNetworkProber {
         event_transmitter: Sender<NetworkEvent>,
         target_ipv4: Ipv4Addr,
         is_paused: Arc<AtomicBool>,
-    ) {
+        should_exit: Arc<AtomicBool>,
+    ) -> JoinHandle<()> {
         use socket2::{Domain, Protocol, Socket, Type};
         use std::net::SocketAddr;
 
         thread::spawn(move || {
             let socket = match Socket::new(Domain::IPV4, Type::RAW, Some(Protocol::ICMPV4)) {
-                Ok(s) => s,
-                Err(e) => {
+                Ok(socket_instance) => socket_instance,
+                Err(error) => {
                     eprintln!("❌ 致命错误: 无法创建 Raw Socket。");
-                    eprintln!("系统报错: {}", e);
+                    eprintln!("系统报错: {}", error);
                     eprintln!("💡 Linux 解决方案: 运行 `sudo setcap cap_net_raw+ep ./mtr`");
                     eprintln!("💡 macOS 解决方案: 请使用 `sudo ./mtr` 运行");
-                    std::process::exit(1);
+                    return;
                 }
             };
 
-            socket.set_read_timeout(Some(Duration::from_millis(10))).expect("Failed to set socket timeout");
-            
+            if let Err(error) = socket.set_read_timeout(Some(Duration::from_millis(10))) {
+                eprintln!("❌ 致命错误: 无法设置 Raw Socket 读超时。");
+                eprintln!("系统报错: {}", error);
+                return;
+            }
+
             let target_addr = SocketAddr::from((target_ipv4, 0));
             let process_identifier = std::process::id() as u16;
             let maximum_route_hops = 30;
             let dynamic_max_ttl = Arc::new(AtomicU8::new(maximum_route_hops));
             let mut sequence_number: u16 = 0;
 
-            loop {
+            while !should_exit.load(Ordering::Relaxed) {
                 if is_paused.load(Ordering::Relaxed) {
                     thread::sleep(Duration::from_millis(100));
                     continue;
@@ -301,58 +421,61 @@ impl ActiveNetworkProber {
 
                 let current_limit = dynamic_max_ttl.load(Ordering::Relaxed);
                 let start_time = Instant::now();
-                let mut in_flight_probes = HashMap::new();
+                let mut in_flight_probes: HashMap<u16, (u8, Instant)> = HashMap::new();
 
-                // 1. 发射探测包 (Scatter Phase)
                 for ttl in 1..=current_limit {
+                    if should_exit.load(Ordering::Relaxed) {
+                        break;
+                    }
+
                     sequence_number = sequence_number.wrapping_add(1);
                     let packet = Self::build_echo_request(sequence_number, process_identifier);
-                    
-                    if socket.set_ttl(ttl as u32).is_ok() && socket.send_to(&packet, &target_addr.into()).is_ok() {
+
+                    if socket.set_ttl(ttl as u32).is_ok()
+                        && socket.send_to(&packet, &target_addr.into()).is_ok()
+                    {
                         in_flight_probes.insert(sequence_number, (ttl, Instant::now()));
                     }
                 }
 
-                // 2. 收集响应报文 (Gather Phase)
                 let mut buffer = [std::mem::MaybeUninit::uninit(); 1024];
                 let gather_window = Duration::from_millis(800);
 
-                while start_time.elapsed() < gather_window {
+                while start_time.elapsed() < gather_window && !should_exit.load(Ordering::Relaxed) {
                     if let Ok((bytes_read, addr)) = socket.recv_from(&mut buffer) {
-                        // 边界防御：丢弃非 IPv4 响应，绝不使用 unwrap 导致进程异常崩溃
                         let source_ip = match addr.as_socket_ipv4() {
-                            Some(v4) => *v4.ip(),
+                            Some(v4_socket_addr) => *v4_socket_addr.ip(),
                             None => continue,
                         };
-                        
-                        // 安全转换内存切片
+
                         let packet_data: &[u8] = unsafe {
                             std::slice::from_raw_parts(buffer.as_ptr() as *const u8, bytes_read)
                         };
 
-                        // 纯函数解析隔离，将恶意的网络字节流清洗为结构化的匹配元数据
                         if let Some(metadata) = Self::extract_probe_metadata(packet_data) {
                             if metadata.process_identifier != process_identifier {
                                 continue;
                             }
 
-                            if let Some((ttl, sent_time)) = in_flight_probes.remove(&metadata.sequence_number) {
+                            if let Some((ttl, sent_time)) =
+                                in_flight_probes.remove(&metadata.sequence_number)
+                            {
                                 let latency_ms = sent_time.elapsed().as_secs_f64() * 1000.0;
-                                let is_success = matches!(metadata.response_type, IcmpResponseType::EchoReply);
+                                let reached_target =
+                                    matches!(metadata.response_type, IcmpResponseType::EchoReply);
 
                                 let _ = event_transmitter.send(NetworkEvent::RouteHopDiscovered {
                                     ttl,
-                                    ip_address: source_ip.to_string(),
+                                    ip_address: source_ip,
                                 });
 
                                 let _ = event_transmitter.send(NetworkEvent::EchoProbeResult {
                                     ttl,
-                                    latency_ms,
-                                    is_timeout: false,
-                                    reached_target: is_success,
+                                    latency_ms: Some(latency_ms),
+                                    reached_target,
                                 });
 
-                                if is_success {
+                                if reached_target {
                                     dynamic_max_ttl.fetch_min(ttl, Ordering::Relaxed);
                                     break;
                                 }
@@ -361,12 +484,10 @@ impl ActiveNetworkProber {
                     }
                 }
 
-                // 3. 清理超时探测包
                 for (_, (ttl, _)) in in_flight_probes {
                     let _ = event_transmitter.send(NetworkEvent::EchoProbeResult {
                         ttl,
-                        latency_ms: 0.0,
-                        is_timeout: true,
+                        latency_ms: None,
                         reached_target: false,
                     });
                 }
@@ -376,46 +497,83 @@ impl ActiveNetworkProber {
                     thread::sleep(Duration::from_millis(1000) - elapsed);
                 }
             }
-        });
+        })
     }
 
-    /// 防御性协议解析，精确提取原始序列号，抵御畸形包引发的内存越界
     #[cfg(unix)]
     fn extract_probe_metadata(packet_data: &[u8]) -> Option<IcmpMatchMetadata> {
-        if packet_data.is_empty() { return None; }
-        
-        let outer_ihl = (packet_data[0] & 0x0F) as usize;
-        let outer_ip_header_length = outer_ihl * 4;
+        if packet_data.len() < 20 {
+            return None;
+        }
 
-        if packet_data.len() < outer_ip_header_length + 8 { return None; }
+        let outer_ihl = (packet_data[0] & 0x0F) as usize;
+        if outer_ihl < 5 {
+            return None;
+        }
+
+        let outer_ip_header_length = outer_ihl * 4;
+        if packet_data.len() < outer_ip_header_length + 8 {
+            return None;
+        }
 
         let icmp_type = packet_data[outer_ip_header_length];
+        let icmp_code = packet_data[outer_ip_header_length + 1];
 
         match icmp_type {
-            0 => { 
-                let identifier = u16::from_be_bytes([packet_data[outer_ip_header_length + 4], packet_data[outer_ip_header_length + 5]]);
-                let sequence_number = u16::from_be_bytes([packet_data[outer_ip_header_length + 6], packet_data[outer_ip_header_length + 7]]);
-                
+            0 => {
+                if icmp_code != 0 {
+                    return None;
+                }
+
+                let identifier = u16::from_be_bytes([
+                    packet_data[outer_ip_header_length + 4],
+                    packet_data[outer_ip_header_length + 5],
+                ]);
+                let sequence_number = u16::from_be_bytes([
+                    packet_data[outer_ip_header_length + 6],
+                    packet_data[outer_ip_header_length + 7],
+                ]);
+
                 Some(IcmpMatchMetadata {
                     response_type: IcmpResponseType::EchoReply,
                     process_identifier: identifier,
                     sequence_number,
                 })
             }
-            11 => { 
-                // 深度解析：Time Exceeded 报文的 Payload 中包含了触发错误的原始 IP 与 ICMP 头部
+            11 => {
+                if icmp_code != 0 {
+                    return None;
+                }
+
                 let inner_ip_offset = outer_ip_header_length + 8;
-                if packet_data.len() <= inner_ip_offset { return None; }
+                if packet_data.len() < inner_ip_offset + 20 {
+                    return None;
+                }
 
                 let inner_ihl = (packet_data[inner_ip_offset] & 0x0F) as usize;
+                if inner_ihl < 5 {
+                    return None;
+                }
+
                 let inner_ip_header_length = inner_ihl * 4;
                 let inner_icmp_offset = inner_ip_offset + inner_ip_header_length;
 
-                if packet_data.len() < inner_icmp_offset + 8 { return None; }
-                if packet_data[inner_ip_offset + 9] != 1 { return None; }
+                if packet_data.len() < inner_icmp_offset + 8 {
+                    return None;
+                }
 
-                let identifier = u16::from_be_bytes([packet_data[inner_icmp_offset + 4], packet_data[inner_icmp_offset + 5]]);
-                let sequence_number = u16::from_be_bytes([packet_data[inner_icmp_offset + 6], packet_data[inner_icmp_offset + 7]]);
+                if packet_data[inner_ip_offset + 9] != 1 {
+                    return None;
+                }
+
+                let identifier = u16::from_be_bytes([
+                    packet_data[inner_icmp_offset + 4],
+                    packet_data[inner_icmp_offset + 5],
+                ]);
+                let sequence_number = u16::from_be_bytes([
+                    packet_data[inner_icmp_offset + 6],
+                    packet_data[inner_icmp_offset + 7],
+                ]);
 
                 Some(IcmpMatchMetadata {
                     response_type: IcmpResponseType::TimeExceeded,
@@ -423,7 +581,7 @@ impl ActiveNetworkProber {
                     sequence_number,
                 })
             }
-            _ => None 
+            _ => None,
         }
     }
 
@@ -438,15 +596,15 @@ impl ActiveNetworkProber {
         packet[7] = (sequence_number & 0xff) as u8;
 
         let mut sum = 0u32;
-        let mut chunks = packet.chunks_exact(2);
-        while let Some(chunk) = chunks.next() {
+        for chunk in packet.chunks_exact(2) {
             sum = sum.wrapping_add((chunk[0] as u32) << 8 | (chunk[1] as u32));
         }
+
         while (sum >> 16) > 0 {
             sum = (sum & 0xffff) + (sum >> 16);
         }
+
         let checksum = !(sum as u16);
-        
         packet[2] = (checksum >> 8) as u8;
         packet[3] = (checksum & 0xff) as u8;
         packet
@@ -456,27 +614,31 @@ impl ActiveNetworkProber {
 // ============================================================================
 // DNS 解析引擎及 TUI 渲染模块
 // ============================================================================
-
 pub struct BackgroundDnsResolver;
 
 impl BackgroundDnsResolver {
     pub fn spawn(
-        ip_query_receiver: Receiver<String>,
+        ip_query_receiver: Receiver<Ipv4Addr>,
         resolution_transmitter: Sender<DnsResolvedEvent>,
-    ) {
+        should_exit: Arc<AtomicBool>,
+    ) -> JoinHandle<()> {
         thread::spawn(move || {
-            while let Ok(ip_string) = ip_query_receiver.recv() {
-                if let Ok(ip_address) = ip_string.parse::<IpAddr>() {
-                    // DNS 阻塞查询放入后台线程，防止拖慢主 UI 渲染和高频网络引擎
-                    let resolved_hostname = lookup_addr(&ip_address).unwrap_or_else(|_| ip_string.clone());
+            while !should_exit.load(Ordering::Relaxed) {
+                match ip_query_receiver.recv_timeout(Duration::from_millis(100)) {
+                    Ok(ip_address) => {
+                        let resolved_hostname =
+                            lookup_addr(&IpAddr::V4(ip_address)).unwrap_or_else(|_| ip_address.to_string());
 
-                    let _ = resolution_transmitter.send(DnsResolvedEvent {
-                        original_ip: ip_string,
-                        resolved_hostname,
-                    });
+                        let _ = resolution_transmitter.send(DnsResolvedEvent {
+                            original_ip: ip_address,
+                            resolved_hostname,
+                        });
+                    }
+                    Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
                 }
             }
-        });
+        })
     }
 
     pub fn resolve_target_host(host: &str) -> Result<Ipv4Addr, String> {
@@ -484,17 +646,21 @@ impl BackgroundDnsResolver {
             return Ok(ip);
         }
 
-        let lookup_str = format!("{}:0", host);
-        match lookup_str.to_socket_addrs() {
-            Ok(mut addrs) => {
-                for addr in addrs.by_ref() {
-                    if let std::net::SocketAddr::V4(v4) = addr {
-                        return Ok(*v4.ip());
+        let lookup_string = format!("{}:0", host);
+        match lookup_string.to_socket_addrs() {
+            Ok(mut socket_addresses) => {
+                for socket_address in socket_addresses.by_ref() {
+                    if let std::net::SocketAddr::V4(ipv4_socket_address) = socket_address {
+                        return Ok(*ipv4_socket_address.ip());
                     }
                 }
-                Err(format!("DNS 解析成功，但未找到与主机 '{}' 匹配的 IPv4 地址", host))
+
+                Err(format!(
+                    "DNS 解析成功，但未找到与主机 '{}' 匹配的 IPv4 地址",
+                    host
+                ))
             }
-            Err(e) => Err(format!("无法解析主机 '{}': {}", host, e)),
+            Err(error) => Err(format!("无法解析主机 '{}': {}", host, error)),
         }
     }
 }
@@ -505,10 +671,10 @@ pub struct MtrApplication {
     route_hops: Vec<HopStatistic>,
     final_destination_ttl: Option<u8>,
     network_event_receiver: Receiver<NetworkEvent>,
-    dns_query_transmitter: Sender<String>,
+    dns_query_transmitter: Sender<Ipv4Addr>,
     dns_result_receiver: Receiver<DnsResolvedEvent>,
-    ip_to_hostname_cache: HashMap<String, String>,
-    in_flight_dns_queries: HashSet<String>,
+    ip_to_hostname_cache: HashMap<Ipv4Addr, String>,
+    in_flight_dns_queries: HashSet<Ipv4Addr>,
     pub is_paused: Arc<AtomicBool>,
 }
 
@@ -517,7 +683,7 @@ impl MtrApplication {
         target_hostname: String,
         target_ip: Ipv4Addr,
         network_event_receiver: Receiver<NetworkEvent>,
-        dns_query_transmitter: Sender<String>,
+        dns_query_transmitter: Sender<Ipv4Addr>,
         dns_result_receiver: Receiver<DnsResolvedEvent>,
         is_paused: Arc<AtomicBool>,
     ) -> Self {
@@ -544,6 +710,25 @@ impl MtrApplication {
         for hop in &mut self.route_hops {
             hop.reset_statistics();
         }
+        self.final_destination_ttl = None;
+    }
+
+    fn get_or_create_hop(&mut self, ttl: u8) -> &mut HopStatistic {
+        let existing_position = self.route_hops.iter().position(|hop| hop.ttl == ttl);
+        if let Some(position) = existing_position {
+            return &mut self.route_hops[position];
+        }
+
+        self.route_hops.push(HopStatistic::new(ttl, None));
+        self.route_hops.sort_by_key(|hop| hop.ttl);
+
+        let inserted_position = self
+            .route_hops
+            .iter()
+            .position(|hop| hop.ttl == ttl)
+            .expect("刚插入的 TTL 必须存在");
+
+        &mut self.route_hops[inserted_position]
     }
 
     pub fn dispatch_incoming_events(&mut self) {
@@ -553,60 +738,38 @@ impl MtrApplication {
                     if !self.in_flight_dns_queries.contains(&ip_address)
                         && !self.ip_to_hostname_cache.contains_key(&ip_address)
                     {
-                        self.in_flight_dns_queries.insert(ip_address.clone());
-                        let _ = self.dns_query_transmitter.send(ip_address.clone());
+                        self.in_flight_dns_queries.insert(ip_address);
+                        let _ = self.dns_query_transmitter.send(ip_address);
                     }
 
-                    if let Some(hop) = self.route_hops.iter_mut().find(|hop| hop.ttl == ttl) {
-                        if hop.ip_address == "???" {
-                            hop.ip_address = ip_address;
-                        }
-                    } else {
-                        self.route_hops.push(HopStatistic::new(ttl, ip_address));
-                        self.route_hops.sort_by_key(|hop| hop.ttl);
+                    let hop = self.get_or_create_hop(ttl);
+                    if hop.ip_address.is_none() {
+                        hop.ip_address = Some(ip_address);
                     }
                 }
                 NetworkEvent::EchoProbeResult {
                     ttl,
                     latency_ms,
-                    is_timeout,
                     reached_target,
                 } => {
-                    if reached_target {
-                        if self.final_destination_ttl.map_or(true, |f| ttl < f) {
-                            self.final_destination_ttl = Some(ttl);
-                        }
+                    if reached_target
+                        && self
+                            .final_destination_ttl
+                            .map_or(true, |known_final_ttl| ttl < known_final_ttl)
+                    {
+                        self.final_destination_ttl = Some(ttl);
                     }
 
-                    if !self.route_hops.iter().any(|hop| hop.ttl == ttl) {
-                        self.route_hops.push(HopStatistic::new(ttl, "???".to_string()));
-                        self.route_hops.sort_by_key(|hop| hop.ttl);
-                    }
-
-                    if let Some(hop) = self.route_hops.iter_mut().find(|hop| hop.ttl == ttl) {
-                        hop.packets_sent += 1;
-                        if !is_timeout {
-                            hop.packets_received += 1;
-                            hop.last_latency_ms = latency_ms;
-                            hop.total_latency_ms += latency_ms;
-                            if latency_ms < hop.best_latency_ms {
-                                hop.best_latency_ms = latency_ms;
-                            }
-                            if latency_ms > hop.worst_latency_ms {
-                                hop.worst_latency_ms = latency_ms;
-                            }
-                        }
-                    }
+                    let hop = self.get_or_create_hop(ttl);
+                    hop.record_probe_result(latency_ms);
                 }
             }
         }
 
         while let Ok(dns_event) = self.dns_result_receiver.try_recv() {
             self.in_flight_dns_queries.remove(&dns_event.original_ip);
-            self.ip_to_hostname_cache.insert(
-                dns_event.original_ip,
-                dns_event.resolved_hostname,
-            );
+            self.ip_to_hostname_cache
+                .insert(dns_event.original_ip, dns_event.resolved_hostname);
         }
 
         if let Some(final_ttl) = self.final_destination_ttl {
@@ -617,11 +780,14 @@ impl MtrApplication {
     pub fn render_frame(&self, frame: &mut Frame) {
         let layout_chunks = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(1),
-                Constraint::Length(2),
-                Constraint::Min(10),
-            ].as_ref())
+            .constraints(
+                [
+                    Constraint::Length(1),
+                    Constraint::Length(2),
+                    Constraint::Min(10),
+                ]
+                .as_ref(),
+            )
             .split(frame.size());
 
         self.render_header(frame, layout_chunks[0]);
@@ -630,20 +796,23 @@ impl MtrApplication {
     }
 
     fn render_header(&self, frame: &mut Frame, area: Rect) {
-        let current_time = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
-        
+        let current_time = chrono::Local::now()
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string();
+
         let header_chunks = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([
-                Constraint::Percentage(70),
-                Constraint::Percentage(30),
-            ].as_ref())
+            .constraints([Constraint::Percentage(70), Constraint::Percentage(30)].as_ref())
             .split(area);
 
-        let header_title = format!(" My Traceroute (mtr) to {} ({})", self.target_hostname, self.target_ip);
-        let title_block = Paragraph::new(header_title)
-            .style(Style::default().add_modifier(Modifier::BOLD));
-            
+        let header_title = format!(
+            " My Traceroute (mtr) to {} ({})",
+            self.target_hostname, self.target_ip
+        );
+
+        let title_block =
+            Paragraph::new(header_title).style(Style::default().add_modifier(Modifier::BOLD));
+
         let time_block = Paragraph::new(current_time)
             .style(Style::default().add_modifier(Modifier::BOLD))
             .alignment(Alignment::Right);
@@ -658,8 +827,12 @@ impl MtrApplication {
         } else {
             ""
         };
-        let guide_text = format!(" Keys: [p] pause/resume{}   [r] restart statistics   [q] quit", pause_status);
-        
+
+        let guide_text = format!(
+            " Keys: [p] pause/resume{}   [r] restart statistics   [q] quit",
+            pause_status
+        );
+
         let mut style = Style::default().fg(Color::DarkGray);
         if self.is_paused.load(Ordering::Relaxed) {
             style = style.fg(Color::Yellow).add_modifier(Modifier::BOLD);
@@ -672,30 +845,33 @@ impl MtrApplication {
     fn render_statistics_table(&self, frame: &mut Frame, area: Rect) {
         let table_headers = ["Host", "Loss%", "Snt", "Last", "Avg", "Best", "Wrst", "StDev"]
             .iter()
-            .map(|header_title| Cell::from(*header_title).style(Style::default().fg(Color::DarkGray)));
-        
+            .map(|header_title| {
+                Cell::from(*header_title).style(Style::default().fg(Color::DarkGray))
+            });
+
         let header_row = Row::new(table_headers)
             .style(Style::default().add_modifier(Modifier::BOLD))
             .height(1)
             .bottom_margin(1);
 
         let data_rows = self.route_hops.iter().map(|hop| {
-            // 1. 处理 Host 显示名称
-            let display_name = if hop.ip_address == "???" {
-                "???".to_string()
-            } else if let Some(hostname) = self.ip_to_hostname_cache.get(&hop.ip_address) {
-                if hostname != &hop.ip_address {
-                    format!("{} ({})", hop.ip_address, hostname)
-                } else {
-                    hop.ip_address.clone()
+            let display_name = match hop.ip_address {
+                None => String::from("???"),
+                Some(ip_address) => {
+                    let ip_string = ip_address.to_string();
+                    if let Some(hostname) = self.ip_to_hostname_cache.get(&ip_address) {
+                        if hostname != &ip_string {
+                            format!("{} ({})", ip_string, hostname)
+                        } else {
+                            ip_string
+                        }
+                    } else {
+                        ip_string
+                    }
                 }
-            } else {
-                hop.ip_address.clone()
             };
 
-            // 2. 根据节点是否已响应，决定统计数据的展示格式
-            let (loss, snt, last, avg, best, wrst, stdev) = if hop.ip_address == "???" {
-                // 如果是未知节点，所有统计字段统一显示为 "-"
+            let (loss, snt, last, avg, best, wrst, stdev) = if hop.ip_address.is_none() {
                 (
                     String::from("-"),
                     String::from("-"),
@@ -706,19 +882,27 @@ impl MtrApplication {
                     String::from("-"),
                 )
             } else {
-                // 如果是已响应节点，正常计算并显示统计数据
                 (
                     format!("{:.1}%", hop.packet_loss_percentage()),
-                    format!("{}", hop.packets_sent),
-                    if hop.last_latency_ms > 0.0 { format!("{:.1}", hop.last_latency_ms) } else { String::from("-") },
-                    if hop.average_latency_ms() > 0.0 { format!("{:.1}", hop.average_latency_ms()) } else { String::from("-") },
-                    if hop.best_latency_ms < f64::MAX { format!("{:.1}", hop.best_latency_ms) } else { String::from("-") },
-                    if hop.worst_latency_ms > 0.0 { format!("{:.1}", hop.worst_latency_ms) } else { String::from("-") },
-                    format!("{:.1}", hop.standard_deviation()),
+                    hop.packets_sent.to_string(),
+                    hop.last_latency_ms
+                        .map(|value| format!("{:.1}", value))
+                        .unwrap_or_else(|| String::from("-")),
+                    hop.average_latency_ms()
+                        .map(|value| format!("{:.1}", value))
+                        .unwrap_or_else(|| String::from("-")),
+                    hop.best_latency_ms
+                        .map(|value| format!("{:.1}", value))
+                        .unwrap_or_else(|| String::from("-")),
+                    hop.worst_latency_ms
+                        .map(|value| format!("{:.1}", value))
+                        .unwrap_or_else(|| String::from("-")),
+                    hop.standard_deviation()
+                        .map(|value| format!("{:.1}", value))
+                        .unwrap_or_else(|| String::from("-")),
                 )
             };
 
-            // 3. 构建当前行的 Cells
             let cells = vec![
                 Cell::from(format!("{}. {}", hop.ttl, display_name)),
                 Cell::from(loss),
@@ -729,6 +913,7 @@ impl MtrApplication {
                 Cell::from(wrst),
                 Cell::from(stdev),
             ];
+
             Row::new(cells).height(1)
         });
 
@@ -754,52 +939,56 @@ impl MtrApplication {
 // ============================================================================
 // 程序入口
 // ============================================================================
-
 fn main() -> io::Result<()> {
-    // Fail-Fast: 预检目标参数，避免进入终端备用屏幕后因解析失败导致的布局破坏
     let args = CliArgs::parse();
     let target_host = args.target;
 
     let target_ipv4 = match BackgroundDnsResolver::resolve_target_host(&target_host) {
         Ok(ip) => ip,
-        Err(e) => {
-            eprintln!("错误: {}", e);
+        Err(error_message) => {
+            eprintln!("错误: {}", error_message);
             std::process::exit(1);
         }
     };
 
-    // 初始化 TUI 资源
-    enable_raw_mode()?;
-    let mut standard_output = io::stdout();
-    execute!(standard_output, EnterAlternateScreen)?;
-    let tui_backend = CrosstermBackend::new(standard_output);
-    let mut terminal_interface = Terminal::new(tui_backend)?;
+    let mut terminal_session = TerminalSession::enter()?;
 
-    // 使用 MPSC 构建无锁的跨线程事件驱动架构
     let (network_tx, network_rx) = mpsc::channel();
     let (dns_query_tx, dns_query_rx) = mpsc::channel();
     let (dns_result_tx, dns_result_rx) = mpsc::channel();
 
     let is_paused = Arc::new(AtomicBool::new(false));
+    let should_exit = Arc::new(AtomicBool::new(false));
 
-    ActiveNetworkProber::spawn(network_tx, target_ipv4, Arc::clone(&is_paused));
-    BackgroundDnsResolver::spawn(dns_query_rx, dns_result_tx);
+    let network_join_handle = ActiveNetworkProber::spawn(
+        network_tx,
+        target_ipv4,
+        Arc::clone(&is_paused),
+        Arc::clone(&should_exit),
+    );
+
+    let dns_join_handle = BackgroundDnsResolver::spawn(
+        dns_query_rx,
+        dns_result_tx,
+        Arc::clone(&should_exit),
+    );
 
     let mut application = MtrApplication::new(
         target_host,
         target_ipv4,
         network_rx,
-        dns_query_tx,
+        dns_query_tx.clone(),
         dns_result_rx,
         is_paused,
     );
 
-    let refresh_interval = Duration::from_millis(100); 
+    let refresh_interval = Duration::from_millis(100);
     let mut last_tick_timestamp = Instant::now();
 
-    // 核心事件循环
     loop {
-        terminal_interface.draw(|frame| application.render_frame(frame))?;
+        terminal_session
+            .terminal_mut()
+            .draw(|frame| application.render_frame(frame))?;
 
         let timeout_duration = refresh_interval
             .checked_sub(last_tick_timestamp.elapsed())
@@ -810,7 +999,11 @@ fn main() -> io::Result<()> {
                 if key_event.kind == KeyEventKind::Press {
                     match key_event.code {
                         KeyCode::Char('q') => break,
-                        KeyCode::Char('c') if key_event.modifiers.contains(KeyModifiers::CONTROL) => break,
+                        KeyCode::Char('c')
+                            if key_event.modifiers.contains(KeyModifiers::CONTROL) =>
+                        {
+                            break
+                        }
                         KeyCode::Char('p') => application.toggle_pause(),
                         KeyCode::Char('r') => application.reset_all_statistics(),
                         _ => {}
@@ -825,10 +1018,13 @@ fn main() -> io::Result<()> {
         }
     }
 
-    // 释放 TUI 资源，防止终端出现乱码
-    disable_raw_mode()?;
-    execute!(terminal_interface.backend_mut(), LeaveAlternateScreen)?;
-    terminal_interface.show_cursor()?;
+    should_exit.store(true, Ordering::Relaxed);
+
+    drop(application);
+    drop(dns_query_tx);
+
+    let _ = network_join_handle.join();
+    let _ = dns_join_handle.join();
 
     Ok(())
 }

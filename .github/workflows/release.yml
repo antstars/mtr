@@ -49,24 +49,6 @@ jobs:
             use_cross: false
             bin_name: mtr
             asset_name: mtr-macos-arm64
-          # --- iOS 真机 (ARM64) ---
-          - os: macos-latest
-            target: aarch64-apple-ios
-            use_cross: false
-            bin_name: mtr
-            asset_name: mtr-ios-arm64
-          # --- iOS 模拟器 (Apple Silicon架构) ---
-          - os: macos-latest
-            target: aarch64-apple-ios-sim
-            use_cross: false
-            bin_name: mtr
-            asset_name: mtr-ios-sim-arm64
-          # --- iOS 模拟器 (旧版 Intel 架构) ---
-          - os: macos-latest
-            target: x86_64-apple-ios
-            use_cross: false
-            bin_name: mtr
-            asset_name: mtr-ios-sim-intel
 
     steps:
       - name: Checkout code

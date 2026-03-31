@@ -680,6 +680,7 @@ impl MtrApplication {
             .bottom_margin(1);
 
         let data_rows = self.route_hops.iter().map(|hop| {
+            // 1. 处理 Host 显示名称
             let display_name = if hop.ip_address == "???" {
                 "???".to_string()
             } else if let Some(hostname) = self.ip_to_hostname_cache.get(&hop.ip_address) {
@@ -692,15 +693,41 @@ impl MtrApplication {
                 hop.ip_address.clone()
             };
 
+            // 2. 根据节点是否已响应，决定统计数据的展示格式
+            let (loss, snt, last, avg, best, wrst, stdev) = if hop.ip_address == "???" {
+                // 如果是未知节点，所有统计字段统一显示为 "-"
+                (
+                    String::from("-"),
+                    String::from("-"),
+                    String::from("-"),
+                    String::from("-"),
+                    String::from("-"),
+                    String::from("-"),
+                    String::from("-"),
+                )
+            } else {
+                // 如果是已响应节点，正常计算并显示统计数据
+                (
+                    format!("{:.1}%", hop.packet_loss_percentage()),
+                    format!("{}", hop.packets_sent),
+                    if hop.last_latency_ms > 0.0 { format!("{:.1}", hop.last_latency_ms) } else { String::from("-") },
+                    if hop.average_latency_ms() > 0.0 { format!("{:.1}", hop.average_latency_ms()) } else { String::from("-") },
+                    if hop.best_latency_ms < f64::MAX { format!("{:.1}", hop.best_latency_ms) } else { String::from("-") },
+                    if hop.worst_latency_ms > 0.0 { format!("{:.1}", hop.worst_latency_ms) } else { String::from("-") },
+                    format!("{:.1}", hop.standard_deviation()),
+                )
+            };
+
+            // 3. 构建当前行的 Cells
             let cells = vec![
                 Cell::from(format!("{}. {}", hop.ttl, display_name)),
-                Cell::from(format!("{:.1}%", hop.packet_loss_percentage())),
-                Cell::from(format!("{}", hop.packets_sent)),
-                Cell::from(if hop.last_latency_ms > 0.0 { format!("{:.1}", hop.last_latency_ms) } else { String::from("-") }),
-                Cell::from(if hop.average_latency_ms() > 0.0 { format!("{:.1}", hop.average_latency_ms()) } else { String::from("-") }),
-                Cell::from(if hop.best_latency_ms < f64::MAX { format!("{:.1}", hop.best_latency_ms) } else { String::from("-") }),
-                Cell::from(if hop.worst_latency_ms > 0.0 { format!("{:.1}", hop.worst_latency_ms) } else { String::from("-") }),
-                Cell::from(format!("{:.1}", hop.standard_deviation())),
+                Cell::from(loss),
+                Cell::from(snt),
+                Cell::from(last),
+                Cell::from(avg),
+                Cell::from(best),
+                Cell::from(wrst),
+                Cell::from(stdev),
             ];
             Row::new(cells).height(1)
         });

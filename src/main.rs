@@ -31,7 +31,7 @@ use std::{
 
 #[derive(Parser, Debug)]
 #[command(name = "Rust MTR")]
-#[command(version = "1.0")]
+#[command(version)]
 #[command(about = "A cross-platform concurrent network diagnostic tool written in Rust", long_about = None)]
 pub struct CliArgs {
     #[arg(required = true)]

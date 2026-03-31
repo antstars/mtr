@@ -7,7 +7,7 @@ use crossterm::{
 use dns_lookup::lookup_addr;
 use ratatui::{
     backend::CrosstermBackend,
-    layout::{Constraint, Direction, Layout, Rect},
+    layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     widgets::{Block, Borders, Cell, Paragraph, Row, Table},
     Frame, Terminal,
@@ -150,6 +150,7 @@ impl ActiveNetworkProber {
 
                 let current_limit = dynamic_max_ttl.load(Ordering::Relaxed);
 
+                // Scatter: 并发发射探针，消除中间节点超时导致的阻塞
                 for ttl in 1..=current_limit {
                     let tx = event_transmitter.clone();
                     let target_ip = target_ipv4;
@@ -231,6 +232,7 @@ impl ActiveNetworkProber {
                                     reached_target: false,
                                 });
                             }
+                            // 必须释放内核句柄，防止高频并发下的资源泄漏
                             IcmpCloseHandle(icmp_handle);
                         }
                     });
@@ -285,7 +287,6 @@ impl ActiveNetworkProber {
 
             socket.set_read_timeout(Some(Duration::from_millis(10))).expect("Failed to set socket timeout");
             
-            // 安全构造目标地址，消除毫无意义的 string parsing 开销
             let target_addr = SocketAddr::from((target_ipv4, 0));
             let process_identifier = std::process::id() as u16;
             let maximum_route_hops = 30;
@@ -318,25 +319,23 @@ impl ActiveNetworkProber {
 
                 while start_time.elapsed() < gather_window {
                     if let Ok((bytes_read, addr)) = socket.recv_from(&mut buffer) {
-                        // 防御 1: 忽略非 IPv4 地址，杜绝直接 unwrap 导致进程崩溃
+                        // 边界防御：丢弃非 IPv4 响应，绝不使用 unwrap 导致进程异常崩溃
                         let source_ip = match addr.as_socket_ipv4() {
                             Some(v4) => *v4.ip(),
                             None => continue,
                         };
                         
-                        // 防御 2: 安全构建初始化后的内存切片
+                        // 安全转换内存切片
                         let packet_data: &[u8] = unsafe {
                             std::slice::from_raw_parts(buffer.as_ptr() as *const u8, bytes_read)
                         };
 
-                        // 3. 将字节流转换为结构化的元数据，剥离了底层的危险偏移量操作
+                        // 纯函数解析隔离，将恶意的网络字节流清洗为结构化的匹配元数据
                         if let Some(metadata) = Self::extract_probe_metadata(packet_data) {
-                            // 校验 1: 此报文是否属于当前 mtr 进程发出的探测
                             if metadata.process_identifier != process_identifier {
                                 continue;
                             }
 
-                            // 校验 2: 基于精确的 Sequence Number 提取对应的发送记录
                             if let Some((ttl, sent_time)) = in_flight_probes.remove(&metadata.sequence_number) {
                                 let latency_ms = sent_time.elapsed().as_secs_f64() * 1000.0;
                                 let is_success = matches!(metadata.response_type, IcmpResponseType::EchoReply);
@@ -355,14 +354,14 @@ impl ActiveNetworkProber {
 
                                 if is_success {
                                     dynamic_max_ttl.fetch_min(ttl, Ordering::Relaxed);
-                                    break; // 已到达终点，可提前终止当前 Gather 循环
+                                    break;
                                 }
                             }
                         }
                     }
                 }
 
-                // 3. 清理超时探测包 (Timeout Handling Phase)
+                // 3. 清理超时探测包
                 for (_, (ttl, _)) in in_flight_probes {
                     let _ = event_transmitter.send(NetworkEvent::EchoProbeResult {
                         ttl,
@@ -372,7 +371,6 @@ impl ActiveNetworkProber {
                     });
                 }
 
-                // 补偿休眠时间，维持整体每秒发送一轮探测的频率
                 let elapsed = start_time.elapsed();
                 if elapsed < Duration::from_millis(1000) {
                     thread::sleep(Duration::from_millis(1000) - elapsed);
@@ -381,26 +379,20 @@ impl ActiveNetworkProber {
         });
     }
 
-    /// 安全、防御性地解析网络报文，提取匹配所需的关键元数据
-    /// 
-    /// 职责：严格管理内存边界，解析不同类型的 ICMP 协议结构。如果发现数据包残缺或格式错误，
-    /// 立即返回 None 以阻止后续处理。
+    /// 防御性协议解析，精确提取原始序列号，抵御畸形包引发的内存越界
     #[cfg(unix)]
     fn extract_probe_metadata(packet_data: &[u8]) -> Option<IcmpMatchMetadata> {
-        // --- 剥离外层 IP Header ---
         if packet_data.is_empty() { return None; }
-        // IPv4 头部第一个字节低 4 位为 IHL (Internet Header Length)
+        
         let outer_ihl = (packet_data[0] & 0x0F) as usize;
         let outer_ip_header_length = outer_ihl * 4;
 
-        // 校验：确保数据包长度足够容纳外层 IP 头和至少 8 字节的外层 ICMP 头
         if packet_data.len() < outer_ip_header_length + 8 { return None; }
 
         let icmp_type = packet_data[outer_ip_header_length];
 
         match icmp_type {
             0 => { 
-                // Type 0: Echo Reply (终点响应)
                 let identifier = u16::from_be_bytes([packet_data[outer_ip_header_length + 4], packet_data[outer_ip_header_length + 5]]);
                 let sequence_number = u16::from_be_bytes([packet_data[outer_ip_header_length + 6], packet_data[outer_ip_header_length + 7]]);
                 
@@ -411,23 +403,17 @@ impl ActiveNetworkProber {
                 })
             }
             11 => { 
-                // Type 11: Time Exceeded (途经路由器丢弃)
-                // 在 Time Exceeded 的 Payload 中，封装了触发此错误的原始 IP Header 和 ICMP Header
+                // 深度解析：Time Exceeded 报文的 Payload 中包含了触发错误的原始 IP 与 ICMP 头部
                 let inner_ip_offset = outer_ip_header_length + 8;
                 if packet_data.len() <= inner_ip_offset { return None; }
 
-                // 解析被内嵌的原始 IP Header
                 let inner_ihl = (packet_data[inner_ip_offset] & 0x0F) as usize;
                 let inner_ip_header_length = inner_ihl * 4;
                 let inner_icmp_offset = inner_ip_offset + inner_ip_header_length;
 
-                // 校验：确保能完整读出内嵌的原始 ICMP 头部的前 8 个字节
                 if packet_data.len() < inner_icmp_offset + 8 { return None; }
-
-                // 校验：确认原始协议确实是 ICMP (协议号 1 在 IP Header 偏移量 9 的位置)
                 if packet_data[inner_ip_offset + 9] != 1 { return None; }
 
-                // 提取原始探测包的 Identifier 和 Sequence Number
                 let identifier = u16::from_be_bytes([packet_data[inner_icmp_offset + 4], packet_data[inner_icmp_offset + 5]]);
                 let sequence_number = u16::from_be_bytes([packet_data[inner_icmp_offset + 6], packet_data[inner_icmp_offset + 7]]);
 
@@ -437,21 +423,20 @@ impl ActiveNetworkProber {
                     sequence_number,
                 })
             }
-            _ => None // 忽略其他非探测相关的 ICMP 类型
+            _ => None 
         }
     }
 
     #[cfg(unix)]
     fn build_echo_request(sequence_number: u16, process_identifier: u16) -> [u8; 8] {
         let mut packet = [0u8; 8];
-        packet[0] = 8; // Type: Echo Request
-        packet[1] = 0; // Code: 0
+        packet[0] = 8;
+        packet[1] = 0;
         packet[4] = (process_identifier >> 8) as u8;
         packet[5] = (process_identifier & 0xff) as u8;
         packet[6] = (sequence_number >> 8) as u8;
         packet[7] = (sequence_number & 0xff) as u8;
 
-        // 计算 ICMP Checksum
         let mut sum = 0u32;
         let mut chunks = packet.chunks_exact(2);
         while let Some(chunk) = chunks.next() {
@@ -482,6 +467,7 @@ impl BackgroundDnsResolver {
         thread::spawn(move || {
             while let Ok(ip_string) = ip_query_receiver.recv() {
                 if let Ok(ip_address) = ip_string.parse::<IpAddr>() {
+                    // DNS 阻塞查询放入后台线程，防止拖慢主 UI 渲染和高频网络引擎
                     let resolved_hostname = lookup_addr(&ip_address).unwrap_or_else(|_| ip_string.clone());
 
                     let _ = resolution_transmitter.send(DnsResolvedEvent {
@@ -644,10 +630,26 @@ impl MtrApplication {
     }
 
     fn render_header(&self, frame: &mut Frame, area: Rect) {
+        let current_time = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+        
+        let header_chunks = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Percentage(70),
+                Constraint::Percentage(30),
+            ].as_ref())
+            .split(area);
+
         let header_title = format!(" My Traceroute (mtr) to {} ({})", self.target_hostname, self.target_ip);
-        let block = Paragraph::new(header_title)
+        let title_block = Paragraph::new(header_title)
             .style(Style::default().add_modifier(Modifier::BOLD));
-        frame.render_widget(block, area);
+            
+        let time_block = Paragraph::new(current_time)
+            .style(Style::default().add_modifier(Modifier::BOLD))
+            .alignment(Alignment::Right);
+
+        frame.render_widget(title_block, header_chunks[0]);
+        frame.render_widget(time_block, header_chunks[1]);
     }
 
     fn render_guide(&self, frame: &mut Frame, area: Rect) {
@@ -727,6 +729,7 @@ impl MtrApplication {
 // ============================================================================
 
 fn main() -> io::Result<()> {
+    // Fail-Fast: 预检目标参数，避免进入终端备用屏幕后因解析失败导致的布局破坏
     let args = CliArgs::parse();
     let target_host = args.target;
 
@@ -738,12 +741,14 @@ fn main() -> io::Result<()> {
         }
     };
 
+    // 初始化 TUI 资源
     enable_raw_mode()?;
     let mut standard_output = io::stdout();
     execute!(standard_output, EnterAlternateScreen)?;
     let tui_backend = CrosstermBackend::new(standard_output);
     let mut terminal_interface = Terminal::new(tui_backend)?;
 
+    // 使用 MPSC 构建无锁的跨线程事件驱动架构
     let (network_tx, network_rx) = mpsc::channel();
     let (dns_query_tx, dns_query_rx) = mpsc::channel();
     let (dns_result_tx, dns_result_rx) = mpsc::channel();
@@ -765,6 +770,7 @@ fn main() -> io::Result<()> {
     let refresh_interval = Duration::from_millis(100); 
     let mut last_tick_timestamp = Instant::now();
 
+    // 核心事件循环
     loop {
         terminal_interface.draw(|frame| application.render_frame(frame))?;
 
@@ -792,6 +798,7 @@ fn main() -> io::Result<()> {
         }
     }
 
+    // 释放 TUI 资源，防止终端出现乱码
     disable_raw_mode()?;
     execute!(terminal_interface.backend_mut(), LeaveAlternateScreen)?;
     terminal_interface.show_cursor()?;

@@ -8,6 +8,7 @@ crossterm = "0.27"
 ratatui = "0.26"
 dns-lookup = "2.0"
 clap = { version = "4.5", features = ["derive"] }
+chrono = "0.4"
 
 # 仅在 Windows 下编译引入
 [target.'cfg(windows)'.dependencies]

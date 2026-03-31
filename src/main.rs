@@ -960,14 +960,14 @@ fn main() -> io::Result<()> {
     let is_paused = Arc::new(AtomicBool::new(false));
     let should_exit = Arc::new(AtomicBool::new(false));
 
-    let network_join_handle = ActiveNetworkProber::spawn(
+    ActiveNetworkProber::spawn(
         network_tx,
         target_ipv4,
         Arc::clone(&is_paused),
         Arc::clone(&should_exit),
     );
 
-    let dns_join_handle = BackgroundDnsResolver::spawn(
+    BackgroundDnsResolver::spawn(
         dns_query_rx,
         dns_result_tx,
         Arc::clone(&should_exit),
@@ -1022,9 +1022,6 @@ fn main() -> io::Result<()> {
 
     drop(application);
     drop(dns_query_tx);
-
-    let _ = network_join_handle.join();
-    let _ = dns_join_handle.join();
 
     Ok(())
 }

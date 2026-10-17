@@ -524,19 +524,17 @@ impl ActiveNetworkProber {
         #[cfg(target_os = "linux")]
         {
             match Socket::new(Domain::IPV4, Type::RAW, Some(Protocol::ICMPV4)) {
-                Ok(socket) => return Ok((socket, SocketKind::Raw)),
-                Err(raw_error) => {
-                    return Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::ICMPV4))
-                        .map(|socket| (socket, SocketKind::Datagram))
-                        .map_err(|datagram_error| {
-                            io::Error::new(
-                                datagram_error.kind(),
-                                format!(
-                                    "非特权 ICMP socket: {datagram_error}; Raw Socket: {raw_error}"
-                                ),
-                            )
-                        });
-                }
+                Ok(socket) => Ok((socket, SocketKind::Raw)),
+                Err(raw_error) => Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::ICMPV4))
+                    .map(|socket| (socket, SocketKind::Datagram))
+                    .map_err(|datagram_error| {
+                        io::Error::new(
+                            datagram_error.kind(),
+                            format!(
+                                "非特权 ICMP socket: {datagram_error}; Raw Socket: {raw_error}"
+                            ),
+                        )
+                    }),
             }
         }
 

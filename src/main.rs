@@ -18,12 +18,18 @@ use std::{
     net::{IpAddr, Ipv4Addr, ToSocketAddrs},
     sync::{
         atomic::{AtomicBool, AtomicU8, Ordering},
-        mpsc::{self, Receiver, Sender},
+        mpsc::{self, Receiver, Sender, SyncSender},
         Arc,
     },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
+
+const MAXIMUM_ROUTE_HOPS: u8 = 30;
+const PROBE_TIMEOUT: Duration = Duration::from_millis(800);
+#[cfg(unix)]
+const PROBE_INTERVAL: Duration = Duration::from_secs(1);
+const NETWORK_EVENT_CAPACITY: usize = 256;
 
 // ============================================================================
 // 终端会话守卫 (RAII)
@@ -191,18 +197,20 @@ struct WindowsProbeTask {
 #[cfg(windows)]
 impl ActiveNetworkProber {
     pub fn spawn(
-        event_transmitter: Sender<NetworkEvent>,
+        event_transmitter: SyncSender<NetworkEvent>,
         target_ipv4: Ipv4Addr,
         is_paused: Arc<AtomicBool>,
         should_exit: Arc<AtomicBool>,
     ) -> JoinHandle<()> {
         thread::spawn(move || {
-            let maximum_route_hops: u8 = 30;
-            let probe_timeout_ms: u32 = 800;
+            let maximum_route_hops = MAXIMUM_ROUTE_HOPS;
+            let probe_timeout_ms = PROBE_TIMEOUT.as_millis() as u32;
             let dynamic_max_ttl = Arc::new(AtomicU8::new(maximum_route_hops));
 
-            let mut ttl_senders: Vec<Sender<WindowsProbeTask>> = Vec::with_capacity(maximum_route_hops as usize);
-            let mut worker_join_handles: Vec<JoinHandle<()>> = Vec::with_capacity(maximum_route_hops as usize);
+            let mut ttl_senders: Vec<Sender<WindowsProbeTask>> =
+                Vec::with_capacity(maximum_route_hops as usize);
+            let mut worker_join_handles: Vec<JoinHandle<()>> =
+                Vec::with_capacity(maximum_route_hops as usize);
 
             for _ in 0..maximum_route_hops {
                 let (task_sender, task_receiver) = mpsc::channel::<WindowsProbeTask>();
@@ -264,7 +272,7 @@ impl ActiveNetworkProber {
 
     fn run_windows_probe_worker(
         task_receiver: Receiver<WindowsProbeTask>,
-        event_transmitter: Sender<NetworkEvent>,
+        event_transmitter: SyncSender<NetworkEvent>,
         dynamic_max_ttl: Arc<AtomicU8>,
         should_exit: Arc<AtomicBool>,
     ) {
@@ -369,6 +377,13 @@ enum IcmpResponseType {
 }
 
 #[cfg(unix)]
+#[derive(Clone, Copy)]
+enum SocketKind {
+    Raw,
+    Datagram,
+}
+
+#[cfg(unix)]
 struct IcmpMatchMetadata {
     pub response_type: IcmpResponseType,
     pub process_identifier: u16,
@@ -381,22 +396,21 @@ pub struct ActiveNetworkProber;
 #[cfg(unix)]
 impl ActiveNetworkProber {
     pub fn spawn(
-        event_transmitter: Sender<NetworkEvent>,
+        event_transmitter: SyncSender<NetworkEvent>,
         target_ipv4: Ipv4Addr,
         is_paused: Arc<AtomicBool>,
         should_exit: Arc<AtomicBool>,
     ) -> JoinHandle<()> {
-        use socket2::{Domain, Protocol, Socket, Type};
         use std::net::SocketAddr;
 
         thread::spawn(move || {
-            let socket = match Socket::new(Domain::IPV4, Type::RAW, Some(Protocol::ICMPV4)) {
+            let (socket, socket_kind) = match Self::create_icmp_socket() {
                 Ok(socket_instance) => socket_instance,
                 Err(error) => {
-                    eprintln!("❌ 致命错误: 无法创建 Raw Socket。");
+                    eprintln!("❌ 无法创建 ICMP 探测 socket。");
                     eprintln!("系统报错: {}", error);
-                    eprintln!("💡 Linux 解决方案: 运行 `sudo setcap cap_net_raw+ep ./mtr`");
-                    eprintln!("💡 macOS 解决方案: 请使用 `sudo ./mtr` 运行");
+                    eprintln!("Linux: run install.sh to grant cap_net_raw; SUID is not supported.");
+                    eprintln!("macOS: run with an account allowed to create ICMP sockets.");
                     return;
                 }
             };
@@ -409,7 +423,7 @@ impl ActiveNetworkProber {
 
             let target_addr = SocketAddr::from((target_ipv4, 0));
             let process_identifier = std::process::id() as u16;
-            let maximum_route_hops = 30;
+            let maximum_route_hops = MAXIMUM_ROUTE_HOPS;
             let dynamic_max_ttl = Arc::new(AtomicU8::new(maximum_route_hops));
             let mut sequence_number: u16 = 0;
 
@@ -439,7 +453,7 @@ impl ActiveNetworkProber {
                 }
 
                 let mut buffer = [std::mem::MaybeUninit::uninit(); 1024];
-                let gather_window = Duration::from_millis(800);
+                let gather_window = PROBE_TIMEOUT;
 
                 while start_time.elapsed() < gather_window && !should_exit.load(Ordering::Relaxed) {
                     if let Ok((bytes_read, addr)) = socket.recv_from(&mut buffer) {
@@ -452,8 +466,12 @@ impl ActiveNetworkProber {
                             std::slice::from_raw_parts(buffer.as_ptr() as *const u8, bytes_read)
                         };
 
-                        if let Some(metadata) = Self::extract_probe_metadata(packet_data) {
-                            if metadata.process_identifier != process_identifier {
+                        if let Some(metadata) =
+                            Self::extract_probe_metadata(packet_data, socket_kind)
+                        {
+                            if matches!(socket_kind, SocketKind::Raw)
+                                && metadata.process_identifier != process_identifier
+                            {
                                 continue;
                             }
 
@@ -493,16 +511,65 @@ impl ActiveNetworkProber {
                 }
 
                 let elapsed = start_time.elapsed();
-                if elapsed < Duration::from_millis(1000) {
-                    thread::sleep(Duration::from_millis(1000) - elapsed);
+                if elapsed < PROBE_INTERVAL {
+                    thread::sleep(PROBE_INTERVAL - elapsed);
                 }
             }
         })
     }
 
+    fn create_icmp_socket() -> io::Result<(socket2::Socket, SocketKind)> {
+        use socket2::{Domain, Protocol, Socket, Type};
+
+        #[cfg(target_os = "linux")]
+        {
+            match Socket::new(Domain::IPV4, Type::RAW, Some(Protocol::ICMPV4)) {
+                Ok(socket) => return Ok((socket, SocketKind::Raw)),
+                Err(raw_error) => {
+                    return Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::ICMPV4))
+                        .map(|socket| (socket, SocketKind::Datagram))
+                        .map_err(|datagram_error| {
+                            io::Error::new(
+                                datagram_error.kind(),
+                                format!(
+                                    "非特权 ICMP socket: {datagram_error}; Raw Socket: {raw_error}"
+                                ),
+                            )
+                        });
+                }
+            }
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        Socket::new(Domain::IPV4, Type::RAW, Some(Protocol::ICMPV4))
+            .map(|socket| (socket, SocketKind::Raw))
+    }
+
     #[cfg(unix)]
-    fn extract_probe_metadata(packet_data: &[u8]) -> Option<IcmpMatchMetadata> {
+    fn extract_probe_metadata(
+        packet_data: &[u8],
+        socket_kind: SocketKind,
+    ) -> Option<IcmpMatchMetadata> {
+        if matches!(socket_kind, SocketKind::Datagram) {
+            if packet_data.len() < 8 {
+                return None;
+            }
+
+            return match (packet_data[0], packet_data[1]) {
+                (0, 0) => Some(IcmpMatchMetadata {
+                    response_type: IcmpResponseType::EchoReply,
+                    process_identifier: u16::from_be_bytes([packet_data[4], packet_data[5]]),
+                    sequence_number: u16::from_be_bytes([packet_data[6], packet_data[7]]),
+                }),
+                _ => None,
+            };
+        }
+
         if packet_data.len() < 20 {
+            return None;
+        }
+
+        if packet_data[0] >> 4 != 4 || packet_data[9] != 1 {
             return None;
         }
 
@@ -550,6 +617,10 @@ impl ActiveNetworkProber {
                     return None;
                 }
 
+                if packet_data[inner_ip_offset] >> 4 != 4 || packet_data[inner_ip_offset + 9] != 1 {
+                    return None;
+                }
+
                 let inner_ihl = (packet_data[inner_ip_offset] & 0x0F) as usize;
                 if inner_ihl < 5 {
                     return None;
@@ -559,10 +630,6 @@ impl ActiveNetworkProber {
                 let inner_icmp_offset = inner_ip_offset + inner_ip_header_length;
 
                 if packet_data.len() < inner_icmp_offset + 8 {
-                    return None;
-                }
-
-                if packet_data[inner_ip_offset + 9] != 1 {
                     return None;
                 }
 
@@ -626,12 +693,17 @@ impl BackgroundDnsResolver {
             while !should_exit.load(Ordering::Relaxed) {
                 match ip_query_receiver.recv_timeout(Duration::from_millis(100)) {
                     Ok(ip_address) => {
-                        let resolved_hostname =
-                            lookup_addr(&IpAddr::V4(ip_address)).unwrap_or_else(|_| ip_address.to_string());
+                        let worker_transmitter = resolution_transmitter.clone();
+                        thread::spawn(move || {
+                            // libc reverse-DNS lookup has no portable cancellation API. Keep it
+                            // outside the control loop so shutdown is not blocked by a slow resolver.
+                            let resolved_hostname = lookup_addr(&IpAddr::V4(ip_address))
+                                .unwrap_or_else(|_| ip_address.to_string());
 
-                        let _ = resolution_transmitter.send(DnsResolvedEvent {
-                            original_ip: ip_address,
-                            resolved_hostname,
+                            let _ = worker_transmitter.send(DnsResolvedEvent {
+                                original_ip: ip_address,
+                                resolved_hostname,
+                            });
                         });
                     }
                     Err(mpsc::RecvTimeoutError::Timeout) => continue,
@@ -755,7 +827,7 @@ impl MtrApplication {
                     if reached_target
                         && self
                             .final_destination_ttl
-                            .map_or(true, |known_final_ttl| ttl < known_final_ttl)
+                            .is_none_or(|known_final_ttl| ttl < known_final_ttl)
                     {
                         self.final_destination_ttl = Some(ttl);
                     }
@@ -796,9 +868,7 @@ impl MtrApplication {
     }
 
     fn render_header(&self, frame: &mut Frame, area: Rect) {
-        let current_time = chrono::Local::now()
-            .format("%Y-%m-%d %H:%M:%S")
-            .to_string();
+        let current_time = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
 
         let header_chunks = Layout::default()
             .direction(Direction::Horizontal)
@@ -843,11 +913,11 @@ impl MtrApplication {
     }
 
     fn render_statistics_table(&self, frame: &mut Frame, area: Rect) {
-        let table_headers = ["Host", "Loss%", "Snt", "Last", "Avg", "Best", "Wrst", "StDev"]
-            .iter()
-            .map(|header_title| {
-                Cell::from(*header_title).style(Style::default().fg(Color::DarkGray))
-            });
+        let table_headers = [
+            "Host", "Loss%", "Snt", "Last", "Avg", "Best", "Wrst", "StDev",
+        ]
+        .iter()
+        .map(|header_title| Cell::from(*header_title).style(Style::default().fg(Color::DarkGray)));
 
         let header_row = Row::new(table_headers)
             .style(Style::default().add_modifier(Modifier::BOLD))
@@ -951,27 +1021,34 @@ fn main() -> io::Result<()> {
         }
     };
 
+    #[cfg(unix)]
+    if let Err(error) = ActiveNetworkProber::create_icmp_socket() {
+        eprintln!("error: unable to create an ICMP probe socket: {error}");
+        #[cfg(target_os = "linux")]
+        eprintln!("Linux: install libcap and run install.sh to grant cap_net_raw.");
+        #[cfg(target_os = "macos")]
+        eprintln!("macOS: run with permission to create raw ICMP sockets.");
+        return Err(error);
+    }
+
     let mut terminal_session = TerminalSession::enter()?;
 
-    let (network_tx, network_rx) = mpsc::channel();
+    let (network_tx, network_rx) = mpsc::sync_channel(NETWORK_EVENT_CAPACITY);
     let (dns_query_tx, dns_query_rx) = mpsc::channel();
     let (dns_result_tx, dns_result_rx) = mpsc::channel();
 
     let is_paused = Arc::new(AtomicBool::new(false));
     let should_exit = Arc::new(AtomicBool::new(false));
 
-    ActiveNetworkProber::spawn(
+    let network_thread = ActiveNetworkProber::spawn(
         network_tx,
         target_ipv4,
         Arc::clone(&is_paused),
         Arc::clone(&should_exit),
     );
 
-    BackgroundDnsResolver::spawn(
-        dns_query_rx,
-        dns_result_tx,
-        Arc::clone(&should_exit),
-    );
+    let dns_thread =
+        BackgroundDnsResolver::spawn(dns_query_rx, dns_result_tx, Arc::clone(&should_exit));
 
     let mut application = MtrApplication::new(
         target_host,
@@ -1022,6 +1099,94 @@ fn main() -> io::Result<()> {
 
     drop(application);
     drop(dns_query_tx);
+    drop(terminal_session);
+    let _ = network_thread.join();
+    let _ = dns_thread.join();
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn builds_echo_request_with_valid_checksum() {
+        let packet = ActiveNetworkProber::build_echo_request(7, 42);
+        let checksum: u32 = packet
+            .chunks_exact(2)
+            .map(|chunk| u16::from_be_bytes([chunk[0], chunk[1]]) as u32)
+            .fold(0u32, |sum, value| sum.wrapping_add(value));
+        assert_eq!((checksum & 0xffff) + (checksum >> 16), 0xffff);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_invalid_ip_protocol_and_truncated_packets() {
+        assert!(ActiveNetworkProber::extract_probe_metadata(&[0; 20], SocketKind::Raw).is_none());
+        assert!(
+            ActiveNetworkProber::extract_probe_metadata(&[0x45; 12], SocketKind::Raw).is_none()
+        );
+        assert!(
+            ActiveNetworkProber::extract_probe_metadata(&[0; 7], SocketKind::Datagram).is_none()
+        );
+
+        let mut packet = vec![0u8; 28];
+        packet[0] = 0x45;
+        packet[9] = 17;
+        assert!(ActiveNetworkProber::extract_probe_metadata(&packet, SocketKind::Raw).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn parses_echo_reply_metadata() {
+        let mut packet = vec![0u8; 28];
+        packet[0] = 0x45;
+        packet[9] = 1;
+        packet[20] = 0;
+        packet[21] = 0;
+        packet[24..26].copy_from_slice(&42u16.to_be_bytes());
+        packet[26..28].copy_from_slice(&7u16.to_be_bytes());
+
+        let metadata = ActiveNetworkProber::extract_probe_metadata(&packet, SocketKind::Raw)
+            .expect("valid reply");
+        assert_eq!(metadata.process_identifier, 42);
+        assert_eq!(metadata.sequence_number, 7);
+        assert!(matches!(
+            metadata.response_type,
+            IcmpResponseType::EchoReply
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn parses_datagram_echo_reply_without_ip_header() {
+        let mut packet = vec![0u8; 8];
+        packet[0] = 0;
+        packet[4..6].copy_from_slice(&42u16.to_be_bytes());
+        packet[6..8].copy_from_slice(&7u16.to_be_bytes());
+
+        let metadata = ActiveNetworkProber::extract_probe_metadata(&packet, SocketKind::Datagram)
+            .expect("valid datagram reply");
+        assert_eq!(metadata.sequence_number, 7);
+        assert!(matches!(
+            metadata.response_type,
+            IcmpResponseType::EchoReply
+        ));
+    }
+
+    #[test]
+    fn calculates_statistics() {
+        let mut statistic = HopStatistic::new(1, None);
+        statistic.record_probe_result(Some(10.0));
+        statistic.record_probe_result(Some(20.0));
+        statistic.record_probe_result(None);
+
+        assert_eq!(statistic.packets_sent, 3);
+        assert_eq!(statistic.packets_received, 2);
+        assert!((statistic.packet_loss_percentage() - 33.3333).abs() < 0.01);
+        assert_eq!(statistic.average_latency_ms(), Some(15.0));
+        assert!((statistic.standard_deviation().unwrap() - 7.071).abs() < 0.01);
+    }
 }

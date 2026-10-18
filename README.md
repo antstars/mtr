@@ -49,6 +49,32 @@ mtr baidu.com
 mtr 39.156.66.10
 ```
 
+### Linux：`sudo` 与 `???` 节点说明
+
+在 Linux 上，`???` 表示该 TTL 未收到可匹配的路由节点 IP，并不表示 DNS 反向解析失败；DNS 解析失败时，界面仍会显示对应 IP 地址。
+
+本程序需要接收路由器返回的 ICMP `Time Exceeded` 报文来识别中间跳点。使用 `sudo` 时，程序可创建 Raw ICMP socket，因此能够显示中间节点。普通用户运行时，若没有 `cap_net_raw` 权限，程序会降级为 Linux 的 ICMP ping socket；该模式仅能识别目标主机的 Echo Reply，无法显示中间路由器的节点，于是前几跳会显示为 `???`。
+
+推荐通过安装脚本授予可执行文件最小必要权限，而不是每次以 `sudo` 运行：
+
+```bash
+./install.sh
+getcap /usr/local/bin/mtr
+
+# 预期包含：/usr/local/bin/mtr cap_net_raw=ep
+mtr <目标地址>
+```
+
+如果直接运行本地编译产物，请为该文件单独设置 capability：
+
+```bash
+sudo setcap cap_net_raw+ep ./target/release/mtr
+getcap ./target/release/mtr
+./target/release/mtr <目标地址>
+```
+
+每次重新编译或替换二进制文件后，通常需要重新设置 capability。仅配置 `net.ipv4.ping_group_range` 只能允许非特权 ping socket，不能让当前程序获取中间路由器的 ICMP `Time Exceeded` 回包。
+
 ### ⌨️ 界面快捷键操作
 
 进入 TUI 界面后，你可以使用以下快捷键进行实时交互：

@@ -9,12 +9,13 @@ use ratatui::{
     backend::CrosstermBackend,
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
-    widgets::{Block, Borders, Cell, Paragraph, Row, Table},
+    widgets::{Block, Borders, Cell, Paragraph, Row, Table, Wrap},
     Frame, Terminal,
 };
 use std::{
     collections::{HashMap, HashSet},
     io,
+    io::Write,
     net::{IpAddr, Ipv4Addr, ToSocketAddrs},
     sync::{
         atomic::{AtomicBool, AtomicU8, Ordering},
@@ -25,10 +26,12 @@ use std::{
     time::{Duration, Instant},
 };
 
+const DEFAULT_REPORT_CYCLES: u32 = 10;
+const DEFAULT_PROBE_INTERVAL_SECONDS: f64 = 1.0;
+
 const MAXIMUM_ROUTE_HOPS: u8 = 30;
+const MAXIMUM_SUPPORTED_HOPS: u8 = 64;
 const PROBE_TIMEOUT: Duration = Duration::from_millis(800);
-#[cfg(unix)]
-const PROBE_INTERVAL: Duration = Duration::from_secs(1);
 const NETWORK_EVENT_CAPACITY: usize = 256;
 
 // ============================================================================
@@ -72,12 +75,75 @@ impl Drop for TerminalSession {
 pub struct CliArgs {
     #[arg(required = true)]
     pub target: String,
+    #[arg(short = 'r', long)]
+    pub report: bool,
+    #[arg(short = 'c', long, value_name = "COUNT", requires = "report")]
+    pub report_cycles: Option<u32>,
+    #[arg(short = 'i', long, value_name = "SECONDS", default_value_t = DEFAULT_PROBE_INTERVAL_SECONDS)]
+    pub interval: f64,
+    #[arg(short = 'n', long)]
+    pub no_dns: bool,
+    #[arg(short = '4', long, conflicts_with = "ipv6")]
+    pub ipv4: bool,
+    #[arg(short = '6', long, conflicts_with = "ipv4")]
+    pub ipv6: bool,
+    #[arg(short = 'm', long, default_value_t = MAXIMUM_ROUTE_HOPS)]
+    pub max_hops: u8,
+}
+
+#[derive(Debug, Clone)]
+pub struct ProbeConfig {
+    pub report: bool,
+    pub report_cycles: u32,
+    pub interval: Duration,
+    pub no_dns: bool,
+    pub max_hops: u8,
+}
+
+impl ProbeConfig {
+    fn from_args(args: &CliArgs) -> Result<Self, String> {
+        if !args.interval.is_finite() || args.interval < PROBE_TIMEOUT.as_secs_f64() {
+            return Err(format!(
+                "interval must be at least {:.1} seconds",
+                PROBE_TIMEOUT.as_secs_f64()
+            ));
+        }
+        if args.max_hops == 0 || args.max_hops > MAXIMUM_SUPPORTED_HOPS {
+            return Err(format!(
+                "max-hops must be between 1 and {}",
+                MAXIMUM_SUPPORTED_HOPS
+            ));
+        }
+        if args.ipv4 && args.target.parse::<std::net::Ipv6Addr>().is_ok() {
+            return Err(String::from("--ipv4 requires an IPv4 target"));
+        }
+        let report_cycles = args.report_cycles.unwrap_or(DEFAULT_REPORT_CYCLES);
+        if report_cycles == 0 {
+            return Err(String::from("report-cycles must be greater than zero"));
+        }
+        let interval = Duration::try_from_secs_f64(args.interval)
+            .map_err(|_| String::from("interval is outside the supported range"))?;
+        if interval < PROBE_TIMEOUT {
+            return Err(format!(
+                "interval must be at least {:.1} seconds",
+                PROBE_TIMEOUT.as_secs_f64()
+            ));
+        }
+
+        Ok(Self {
+            report: args.report,
+            report_cycles,
+            interval,
+            no_dns: args.no_dns,
+            max_hops: args.max_hops,
+        })
+    }
 }
 
 #[derive(Debug, Clone)]
 pub struct HopStatistic {
     pub ttl: u8,
-    pub ip_address: Option<Ipv4Addr>,
+    pub ip_address: Option<IpAddr>,
     pub packets_sent: u32,
     pub packets_received: u32,
     pub last_latency_ms: Option<f64>,
@@ -88,7 +154,7 @@ pub struct HopStatistic {
 }
 
 impl HopStatistic {
-    pub fn new(ttl: u8, ip_address: Option<Ipv4Addr>) -> Self {
+    pub fn new(ttl: u8, ip_address: Option<IpAddr>) -> Self {
         Self {
             ttl,
             ip_address,
@@ -164,17 +230,83 @@ impl HopStatistic {
 pub enum NetworkEvent {
     RouteHopDiscovered {
         ttl: u8,
-        ip_address: Ipv4Addr,
+        ip_address: IpAddr,
     },
     EchoProbeResult {
         ttl: u8,
         latency_ms: Option<f64>,
         reached_target: bool,
     },
+    ProbeCycleComplete,
+    ProbeError {
+        message: String,
+        suggest_capability: bool,
+    },
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum NetworkStatus {
+    Ready,
+    Reduced {
+        capability_command: Option<String>,
+    },
+    Unavailable {
+        details: String,
+        capability_command: Option<String>,
+    },
+}
+
+#[cfg(target_os = "linux")]
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+#[cfg(target_os = "linux")]
+fn capability_command() -> Option<String> {
+    let executable_path = std::env::current_exe()
+        .ok()
+        .and_then(|path| path.into_os_string().into_string().ok())?;
+    if contains_unsafe_display_characters(&executable_path) {
+        return None;
+    }
+    Some(format!(
+        "sudo setcap cap_net_raw+ep {}",
+        shell_quote(&executable_path)
+    ))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn capability_command() -> Option<String> {
+    None
+}
+
+#[cfg(windows)]
+fn windows_network_status() -> NetworkStatus {
+    use windows_sys::Win32::NetworkManagement::IpHelper::{IcmpCloseHandle, IcmpCreateFile};
+
+    // SAFETY: IcmpCreateFile receives no pointers and returns an opaque handle;
+    // every successful handle is closed before this function returns.
+    unsafe {
+        let handle = IcmpCreateFile();
+        if handle == 0 || handle == (-1isize) as _ {
+            NetworkStatus::Unavailable {
+                details: format!(
+                    "Windows IcmpCreateFile failed: {}",
+                    std::io::Error::last_os_error()
+                ),
+                capability_command: None,
+            }
+        } else {
+            // The handle is owned exclusively here and is released before returning.
+            let _ = IcmpCloseHandle(handle);
+            NetworkStatus::Ready
+        }
+    }
 }
 
 pub struct DnsResolvedEvent {
-    pub original_ip: Ipv4Addr,
+    pub original_ip: IpAddr,
     pub resolved_hostname: String,
 }
 
@@ -201,9 +333,10 @@ impl ActiveNetworkProber {
         target_ipv4: Ipv4Addr,
         is_paused: Arc<AtomicBool>,
         should_exit: Arc<AtomicBool>,
+        config: ProbeConfig,
     ) -> JoinHandle<()> {
         thread::spawn(move || {
-            let maximum_route_hops = MAXIMUM_ROUTE_HOPS;
+            let maximum_route_hops = config.max_hops;
             let probe_timeout_ms = PROBE_TIMEOUT.as_millis() as u32;
             let dynamic_max_ttl = Arc::new(AtomicU8::new(maximum_route_hops));
 
@@ -211,6 +344,7 @@ impl ActiveNetworkProber {
                 Vec::with_capacity(maximum_route_hops as usize);
             let mut worker_join_handles: Vec<JoinHandle<()>> =
                 Vec::with_capacity(maximum_route_hops as usize);
+            let mut completed_cycles = 0u32;
 
             for _ in 0..maximum_route_hops {
                 let (task_sender, task_receiver) = mpsc::channel::<WindowsProbeTask>();
@@ -255,11 +389,16 @@ impl ActiveNetworkProber {
                 }
 
                 let sleep_start_time = Instant::now();
-                while sleep_start_time.elapsed() < Duration::from_millis(1000) {
+                while sleep_start_time.elapsed() < config.interval {
                     if should_exit.load(Ordering::Relaxed) || is_paused.load(Ordering::Relaxed) {
                         break;
                     }
                     thread::sleep(Duration::from_millis(50));
+                }
+                let _ = event_transmitter.send(NetworkEvent::ProbeCycleComplete);
+                completed_cycles = completed_cycles.saturating_add(1);
+                if config.report && completed_cycles >= config.report_cycles {
+                    break;
                 }
             }
 
@@ -328,7 +467,7 @@ impl ActiveNetworkProber {
                     if icmp_reply.Address != 0 {
                         let _ = event_transmitter.send(NetworkEvent::RouteHopDiscovered {
                             ttl: probe_task.ttl,
-                            ip_address: router_ipv4,
+                            ip_address: IpAddr::V4(router_ipv4),
                         });
                     }
 
@@ -367,6 +506,160 @@ impl ActiveNetworkProber {
     }
 }
 
+#[cfg(unix)]
+pub struct ActiveIpv6NetworkProber;
+
+#[cfg(unix)]
+impl ActiveIpv6NetworkProber {
+    pub fn spawn(
+        event_transmitter: SyncSender<NetworkEvent>,
+        target_ipv6: std::net::Ipv6Addr,
+        is_paused: Arc<AtomicBool>,
+        should_exit: Arc<AtomicBool>,
+        config: ProbeConfig,
+    ) -> JoinHandle<()> {
+        use socket2::{Domain, Protocol, Socket, Type};
+        use std::net::{SocketAddr, SocketAddrV6};
+
+        thread::spawn(move || {
+            let socket = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::ICMPV6))
+                .map(|socket| (socket, SocketKind::Datagram))
+                .or_else(|_| {
+                    Socket::new(Domain::IPV6, Type::RAW, Some(Protocol::ICMPV6))
+                        .map(|socket| (socket, SocketKind::Raw))
+                });
+            let (socket, socket_kind) = match socket {
+                Ok(socket) => socket,
+                Err(error) => {
+                    let _ = event_transmitter.send(NetworkEvent::ProbeError {
+                        message: error.to_string(),
+                        suggest_capability: true,
+                    });
+                    return;
+                }
+            };
+            if matches!(socket_kind, SocketKind::Raw) {
+                let _ = event_transmitter.send(NetworkEvent::ProbeError {
+                    message: String::from(
+                        "raw ICMPv6 requires pseudo-header checksum support; use an ICMPv6 datagram socket",
+                    ),
+                    suggest_capability: false,
+                });
+                return;
+            }
+            if let Err(error) = socket.set_read_timeout(Some(Duration::from_millis(10))) {
+                let _ = event_transmitter.send(NetworkEvent::ProbeError {
+                    message: error.to_string(),
+                    suggest_capability: false,
+                });
+                return;
+            }
+
+            let target_addr = SocketAddr::V6(SocketAddrV6::new(target_ipv6, 0, 0, 0));
+            let process_identifier = std::process::id() as u16;
+            let mut sequence_number = 0u16;
+            let mut completed_cycles = 0u32;
+            let dynamic_max_ttl = Arc::new(AtomicU8::new(config.max_hops));
+
+            while !should_exit.load(Ordering::Relaxed) {
+                if is_paused.load(Ordering::Relaxed) {
+                    thread::sleep(Duration::from_millis(100));
+                    continue;
+                }
+                let start_time = Instant::now();
+                let mut in_flight = HashMap::new();
+                let current_limit = dynamic_max_ttl.load(Ordering::Relaxed);
+                let mut successful_sends = 0u32;
+                let mut last_send_error = None;
+                for ttl in 1..=current_limit {
+                    sequence_number = sequence_number.wrapping_add(1);
+                    let packet = build_ipv6_echo_request(sequence_number, process_identifier);
+                    match socket.set_unicast_hops_v6(ttl as u32) {
+                        Ok(()) => match socket.send_to(&packet, &target_addr.into()) {
+                            Ok(_) => {
+                                successful_sends += 1;
+                                in_flight.insert(sequence_number, (ttl, Instant::now()));
+                            }
+                            Err(error) => last_send_error = Some(error),
+                        },
+                        Err(error) => last_send_error = Some(error),
+                    }
+                }
+                if successful_sends == 0 {
+                    let _ = event_transmitter.send(NetworkEvent::ProbeError {
+                        message: format!(
+                            "unable to send ICMPv6 probe: {}",
+                            last_send_error
+                                .map(|error| error.to_string())
+                                .unwrap_or_else(|| String::from("unknown socket error"))
+                        ),
+                        suggest_capability: false,
+                    });
+                    return;
+                }
+
+                let mut buffer = [std::mem::MaybeUninit::uninit(); 2048];
+                while start_time.elapsed() < PROBE_TIMEOUT && !should_exit.load(Ordering::Relaxed) {
+                    if let Ok((bytes_read, address)) = socket.recv_from(&mut buffer) {
+                        let source_ip = match address.as_socket_ipv6() {
+                            Some(address) => IpAddr::V6(*address.ip()),
+                            None => continue,
+                        };
+                        // SAFETY: recv_from reports the initialized prefix length and the
+                        // socket API guarantees bytes_read does not exceed the buffer size.
+                        let packet_data = unsafe {
+                            std::slice::from_raw_parts(buffer.as_ptr() as *const u8, bytes_read)
+                        };
+                        if let Some(metadata) = extract_ipv6_probe_metadata(packet_data) {
+                            if matches!(socket_kind, SocketKind::Raw)
+                                && metadata.process_identifier != process_identifier
+                            {
+                                continue;
+                            }
+                            if let Some((ttl, sent_time)) =
+                                in_flight.remove(&metadata.sequence_number)
+                            {
+                                let reached_target =
+                                    matches!(metadata.response_type, IcmpResponseType::EchoReply);
+                                let _ = event_transmitter.send(NetworkEvent::RouteHopDiscovered {
+                                    ttl,
+                                    ip_address: source_ip,
+                                });
+                                let _ = event_transmitter.send(NetworkEvent::EchoProbeResult {
+                                    ttl,
+                                    latency_ms: Some(sent_time.elapsed().as_secs_f64() * 1000.0),
+                                    reached_target,
+                                });
+                                if reached_target {
+                                    dynamic_max_ttl.fetch_min(ttl, Ordering::Relaxed);
+                                }
+                            }
+                        }
+                    }
+                }
+                for (ttl, _) in in_flight.values() {
+                    let _ = event_transmitter.send(NetworkEvent::EchoProbeResult {
+                        ttl: *ttl,
+                        latency_ms: None,
+                        reached_target: false,
+                    });
+                }
+                while start_time.elapsed() < config.interval {
+                    if should_exit.load(Ordering::Relaxed) || is_paused.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(50));
+                }
+                let _ = event_transmitter.send(NetworkEvent::ProbeCycleComplete);
+                completed_cycles = completed_cycles.saturating_add(1);
+                if config.report && completed_cycles >= config.report_cycles {
+                    break;
+                }
+            }
+        })
+    }
+}
+
 // ============================================================================
 // 底层网络引擎 - Unix (Linux/macOS) 实现
 // ============================================================================
@@ -391,6 +684,83 @@ struct IcmpMatchMetadata {
 }
 
 #[cfg(unix)]
+#[allow(dead_code)]
+fn extract_ipv6_probe_metadata(packet_data: &[u8]) -> Option<IcmpMatchMetadata> {
+    const IPV6_HEADER_LENGTH: usize = 40;
+    const ICMPV6_HEADER_LENGTH: usize = 8;
+
+    let icmp_offset = if packet_data.len() >= IPV6_HEADER_LENGTH && packet_data[0] >> 4 == 6 {
+        if packet_data[6] != 58 {
+            return None;
+        }
+        IPV6_HEADER_LENGTH
+    } else {
+        0
+    };
+
+    if packet_data.len() < icmp_offset + ICMPV6_HEADER_LENGTH {
+        return None;
+    }
+
+    match packet_data[icmp_offset] {
+        129 => {
+            if packet_data[icmp_offset + 1] != 0 {
+                return None;
+            }
+            Some(IcmpMatchMetadata {
+                response_type: IcmpResponseType::EchoReply,
+                process_identifier: u16::from_be_bytes([
+                    packet_data[icmp_offset + 4],
+                    packet_data[icmp_offset + 5],
+                ]),
+                sequence_number: u16::from_be_bytes([
+                    packet_data[icmp_offset + 6],
+                    packet_data[icmp_offset + 7],
+                ]),
+            })
+        }
+        3 => {
+            if packet_data[icmp_offset + 1] > 1 {
+                return None;
+            }
+            let embedded_ipv6_offset = icmp_offset + ICMPV6_HEADER_LENGTH;
+            let embedded_icmp_offset = embedded_ipv6_offset + IPV6_HEADER_LENGTH;
+            if packet_data.len() < embedded_icmp_offset + ICMPV6_HEADER_LENGTH
+                || packet_data[embedded_ipv6_offset] >> 4 != 6
+                || packet_data[embedded_ipv6_offset + 6] != 58
+                || packet_data[embedded_icmp_offset] != 128
+            {
+                return None;
+            }
+            Some(IcmpMatchMetadata {
+                response_type: IcmpResponseType::TimeExceeded,
+                process_identifier: u16::from_be_bytes([
+                    packet_data[embedded_icmp_offset + 4],
+                    packet_data[embedded_icmp_offset + 5],
+                ]),
+                sequence_number: u16::from_be_bytes([
+                    packet_data[embedded_icmp_offset + 6],
+                    packet_data[embedded_icmp_offset + 7],
+                ]),
+            })
+        }
+        _ => None,
+    }
+}
+
+#[cfg(unix)]
+#[allow(dead_code)]
+fn build_ipv6_echo_request(sequence_number: u16, process_identifier: u16) -> [u8; 8] {
+    // ICMPv6 checksum is filled by the kernel for the planned SOCK_DGRAM path;
+    // raw-socket integration must replace this builder with pseudo-header checksum handling.
+    let mut packet = [0u8; 8];
+    packet[0] = 128;
+    packet[4..6].copy_from_slice(&process_identifier.to_be_bytes());
+    packet[6..8].copy_from_slice(&sequence_number.to_be_bytes());
+    packet
+}
+
+#[cfg(unix)]
 pub struct ActiveNetworkProber;
 
 #[cfg(unix)]
@@ -400,6 +770,7 @@ impl ActiveNetworkProber {
         target_ipv4: Ipv4Addr,
         is_paused: Arc<AtomicBool>,
         should_exit: Arc<AtomicBool>,
+        config: ProbeConfig,
     ) -> JoinHandle<()> {
         use std::net::SocketAddr;
 
@@ -411,6 +782,10 @@ impl ActiveNetworkProber {
                     eprintln!("系统报错: {}", error);
                     eprintln!("Linux: run install.sh to grant cap_net_raw; SUID is not supported.");
                     eprintln!("macOS: run with an account allowed to create ICMP sockets.");
+                    let _ = event_transmitter.send(NetworkEvent::ProbeError {
+                        message: error.to_string(),
+                        suggest_capability: true,
+                    });
                     return;
                 }
             };
@@ -418,14 +793,19 @@ impl ActiveNetworkProber {
             if let Err(error) = socket.set_read_timeout(Some(Duration::from_millis(10))) {
                 eprintln!("❌ 致命错误: 无法设置 Raw Socket 读超时。");
                 eprintln!("系统报错: {}", error);
+                let _ = event_transmitter.send(NetworkEvent::ProbeError {
+                    message: error.to_string(),
+                    suggest_capability: false,
+                });
                 return;
             }
 
             let target_addr = SocketAddr::from((target_ipv4, 0));
             let process_identifier = std::process::id() as u16;
-            let maximum_route_hops = MAXIMUM_ROUTE_HOPS;
+            let maximum_route_hops = config.max_hops;
             let dynamic_max_ttl = Arc::new(AtomicU8::new(maximum_route_hops));
             let mut sequence_number: u16 = 0;
+            let mut completed_cycles = 0u32;
 
             while !should_exit.load(Ordering::Relaxed) {
                 if is_paused.load(Ordering::Relaxed) {
@@ -484,7 +864,7 @@ impl ActiveNetworkProber {
 
                                 let _ = event_transmitter.send(NetworkEvent::RouteHopDiscovered {
                                     ttl,
-                                    ip_address: source_ip,
+                                    ip_address: IpAddr::V4(source_ip),
                                 });
 
                                 let _ = event_transmitter.send(NetworkEvent::EchoProbeResult {
@@ -511,8 +891,18 @@ impl ActiveNetworkProber {
                 }
 
                 let elapsed = start_time.elapsed();
-                if elapsed < PROBE_INTERVAL {
-                    thread::sleep(PROBE_INTERVAL - elapsed);
+                let probe_interval = config.interval;
+                let sleep_start_time = Instant::now();
+                while elapsed + sleep_start_time.elapsed() < probe_interval {
+                    if should_exit.load(Ordering::Relaxed) || is_paused.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(50));
+                }
+                let _ = event_transmitter.send(NetworkEvent::ProbeCycleComplete);
+                completed_cycles = completed_cycles.saturating_add(1);
+                if config.report && completed_cycles >= config.report_cycles {
+                    break;
                 }
             }
         })
@@ -683,7 +1073,7 @@ pub struct BackgroundDnsResolver;
 
 impl BackgroundDnsResolver {
     pub fn spawn(
-        ip_query_receiver: Receiver<Ipv4Addr>,
+        ip_query_receiver: Receiver<IpAddr>,
         resolution_transmitter: Sender<DnsResolvedEvent>,
         should_exit: Arc<AtomicBool>,
     ) -> JoinHandle<()> {
@@ -695,8 +1085,10 @@ impl BackgroundDnsResolver {
                         thread::spawn(move || {
                             // libc reverse-DNS lookup has no portable cancellation API. Keep it
                             // outside the control loop so shutdown is not blocked by a slow resolver.
-                            let resolved_hostname = lookup_addr(&IpAddr::V4(ip_address))
-                                .unwrap_or_else(|_| ip_address.to_string());
+                            let resolved_hostname = lookup_addr(&ip_address)
+                                .ok()
+                                .filter(|hostname| !contains_unsafe_display_characters(hostname))
+                                .unwrap_or_else(|| ip_address.to_string());
 
                             let _ = worker_transmitter.send(DnsResolvedEvent {
                                 original_ip: ip_address,
@@ -711,17 +1103,37 @@ impl BackgroundDnsResolver {
         })
     }
 
-    pub fn resolve_target_host(host: &str) -> Result<Ipv4Addr, String> {
+    pub fn resolve_target_host(host: &str, prefer_ipv6: bool) -> Result<IpAddr, String> {
         if let Ok(ip) = host.parse::<Ipv4Addr>() {
-            return Ok(ip);
+            if prefer_ipv6 {
+                return Err(String::from("--ipv6 requires an IPv6 target"));
+            }
+            return Ok(IpAddr::V4(ip));
+        }
+        if let Ok(ip) = host.parse::<std::net::Ipv6Addr>() {
+            if !prefer_ipv6 {
+                return Err(String::from("IPv6 target requires --ipv6"));
+            }
+            if ip.segments()[0] & 0xffc0 == 0xfe80 {
+                return Err(String::from(
+                    "link-local IPv6 targets require an interface scope and are not supported",
+                ));
+            }
+            return Ok(IpAddr::V6(ip));
         }
 
         let lookup_string = format!("{}:0", host);
         match lookup_string.to_socket_addrs() {
             Ok(mut socket_addresses) => {
                 for socket_address in socket_addresses.by_ref() {
-                    if let std::net::SocketAddr::V4(ipv4_socket_address) = socket_address {
-                        return Ok(*ipv4_socket_address.ip());
+                    match socket_address {
+                        std::net::SocketAddr::V4(address) if !prefer_ipv6 => {
+                            return Ok(IpAddr::V4(*address.ip()));
+                        }
+                        std::net::SocketAddr::V6(address) if prefer_ipv6 => {
+                            return Ok(IpAddr::V6(*address.ip()));
+                        }
+                        _ => {}
                     }
                 }
 
@@ -737,25 +1149,33 @@ impl BackgroundDnsResolver {
 
 pub struct MtrApplication {
     target_hostname: String,
-    target_ip: Ipv4Addr,
+    target_ip: IpAddr,
     route_hops: Vec<HopStatistic>,
     final_destination_ttl: Option<u8>,
     network_event_receiver: Receiver<NetworkEvent>,
-    dns_query_transmitter: Sender<Ipv4Addr>,
+    dns_query_transmitter: Sender<IpAddr>,
     dns_result_receiver: Receiver<DnsResolvedEvent>,
-    ip_to_hostname_cache: HashMap<Ipv4Addr, String>,
-    in_flight_dns_queries: HashSet<Ipv4Addr>,
+    ip_to_hostname_cache: HashMap<IpAddr, String>,
+    in_flight_dns_queries: HashSet<IpAddr>,
     pub is_paused: Arc<AtomicBool>,
+    network_status: NetworkStatus,
+    config: ProbeConfig,
+    completed_cycles: u32,
+    show_dns: bool,
+    started_at: chrono::DateTime<chrono::Local>,
 }
 
 impl MtrApplication {
-    pub fn new(
+    #[allow(clippy::too_many_arguments)]
+    fn new(
         target_hostname: String,
-        target_ip: Ipv4Addr,
+        target_ip: IpAddr,
         network_event_receiver: Receiver<NetworkEvent>,
-        dns_query_transmitter: Sender<Ipv4Addr>,
+        dns_query_transmitter: Sender<IpAddr>,
         dns_result_receiver: Receiver<DnsResolvedEvent>,
         is_paused: Arc<AtomicBool>,
+        network_status: NetworkStatus,
+        config: ProbeConfig,
     ) -> Self {
         Self {
             target_hostname,
@@ -768,12 +1188,24 @@ impl MtrApplication {
             ip_to_hostname_cache: HashMap::new(),
             in_flight_dns_queries: HashSet::new(),
             is_paused,
+            network_status,
+            show_dns: !config.no_dns,
+            config,
+            completed_cycles: 0,
+            started_at: chrono::Local::now(),
         }
     }
 
     pub fn toggle_pause(&self) {
         let current_state = self.is_paused.load(Ordering::Relaxed);
         self.is_paused.store(!current_state, Ordering::Relaxed);
+    }
+
+    pub fn toggle_dns(&mut self) {
+        if self.config.no_dns {
+            return;
+        }
+        self.show_dns = !self.show_dns;
     }
 
     pub fn reset_all_statistics(&mut self) {
@@ -805,7 +1237,8 @@ impl MtrApplication {
         while let Ok(event) = self.network_event_receiver.try_recv() {
             match event {
                 NetworkEvent::RouteHopDiscovered { ttl, ip_address } => {
-                    if !self.in_flight_dns_queries.contains(&ip_address)
+                    if self.show_dns
+                        && !self.in_flight_dns_queries.contains(&ip_address)
                         && !self.ip_to_hostname_cache.contains_key(&ip_address)
                     {
                         self.in_flight_dns_queries.insert(ip_address);
@@ -833,6 +1266,18 @@ impl MtrApplication {
                     let hop = self.get_or_create_hop(ttl);
                     hop.record_probe_result(latency_ms);
                 }
+                NetworkEvent::ProbeCycleComplete => {
+                    self.completed_cycles = self.completed_cycles.saturating_add(1);
+                }
+                NetworkEvent::ProbeError {
+                    message: error_message,
+                    suggest_capability,
+                } => {
+                    self.network_status = NetworkStatus::Unavailable {
+                        details: error_message,
+                        capability_command: suggest_capability.then(capability_command).flatten(),
+                    };
+                }
             }
         }
 
@@ -848,23 +1293,51 @@ impl MtrApplication {
     }
 
     pub fn render_frame(&self, frame: &mut Frame) {
+        let status_lines = self.network_status_message();
+        let guide_lines = self.guide_message();
+        let status_height = (wrapped_line_count(&status_lines, frame.size().width) as u16)
+            .min(frame.size().height.saturating_sub(1));
+        let guide_height = (wrapped_line_count(&guide_lines, frame.size().width) as u16)
+            .min(frame.size().height.saturating_sub(1 + status_height));
         let layout_chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints(
                 [
                     Constraint::Length(1),
-                    Constraint::Length(2),
-                    Constraint::Min(10),
+                    Constraint::Length(status_height),
+                    Constraint::Length(guide_height),
+                    Constraint::Min(0),
                 ]
                 .as_ref(),
             )
             .split(frame.size());
 
         self.render_header(frame, layout_chunks[0]);
-        self.render_guide(frame, layout_chunks[1]);
-        self.render_statistics_table(frame, layout_chunks[2]);
+        self.render_network_status(frame, layout_chunks[1]);
+        self.render_guide(frame, layout_chunks[2]);
+        self.render_statistics_table(frame, layout_chunks[3]);
     }
 
+    fn network_status_message(&self) -> String {
+        network_status_message(&self.network_status)
+    }
+
+    fn render_network_status(&self, frame: &mut Frame, area: Rect) {
+        let style = match &self.network_status {
+            NetworkStatus::Ready => Style::default(),
+            NetworkStatus::Reduced { .. } => Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+            NetworkStatus::Unavailable { .. } => {
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+            }
+        };
+        let paragraph = Paragraph::new(self.network_status_message())
+            .style(style)
+            .wrap(Wrap { trim: false })
+            .block(Block::default().borders(Borders::NONE));
+        frame.render_widget(paragraph, area);
+    }
     fn render_header(&self, frame: &mut Frame, area: Rect) {
         let current_time = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
 
@@ -890,24 +1363,39 @@ impl MtrApplication {
     }
 
     fn render_guide(&self, frame: &mut Frame, area: Rect) {
+        let guide_text = self.guide_message();
+        let mut style = Style::default().fg(Color::DarkGray);
+        if self.is_paused.load(Ordering::Relaxed) {
+            style = style.fg(Color::Yellow).add_modifier(Modifier::BOLD);
+        }
+
+        let paragraph = Paragraph::new(guide_text)
+            .style(style)
+            .wrap(Wrap { trim: false });
+        frame.render_widget(paragraph, area);
+    }
+
+    fn guide_message(&self) -> String {
         let pause_status = if self.is_paused.load(Ordering::Relaxed) {
             " [PAUSED]"
         } else {
             ""
         };
 
-        let guide_text = format!(
-            " Keys: [p] pause/resume{}   [r] restart statistics   [q] quit",
-            pause_status
-        );
-
-        let mut style = Style::default().fg(Color::DarkGray);
-        if self.is_paused.load(Ordering::Relaxed) {
-            style = style.fg(Color::Yellow).add_modifier(Modifier::BOLD);
-        }
-
-        let paragraph = Paragraph::new(guide_text).style(style);
-        frame.render_widget(paragraph, area);
+        let dns_hint = if self.config.no_dns {
+            String::new()
+        } else {
+            format!("   [n] DNS ({})", if self.show_dns { "on" } else { "off" })
+        };
+        format!(
+            " Keys: [p] pause/resume{}   [r] restart{}   [q] quit\n ICMP {} | {:.1}s | max-hops {} | cycles {}",
+            pause_status,
+            dns_hint,
+            if self.target_ip.is_ipv4() { "IPv4" } else { "IPv6" },
+            self.config.interval.as_secs_f64(),
+            self.config.max_hops,
+            self.completed_cycles,
+        )
     }
 
     fn render_statistics_table(&self, frame: &mut Frame, area: Rect) {
@@ -927,9 +1415,13 @@ impl MtrApplication {
                 None => String::from("???"),
                 Some(ip_address) => {
                     let ip_string = ip_address.to_string();
-                    if let Some(hostname) = self.ip_to_hostname_cache.get(&ip_address) {
-                        if hostname != &ip_string {
-                            format!("{} ({})", ip_string, hostname)
+                    if self.show_dns {
+                        if let Some(hostname) = self.ip_to_hostname_cache.get(&ip_address) {
+                            if hostname != &ip_string {
+                                format!("{} ({})", ip_string, hostname)
+                            } else {
+                                ip_string
+                            }
                         } else {
                             ip_string
                         }
@@ -1004,14 +1496,239 @@ impl MtrApplication {
     }
 }
 
+fn wrapped_line_count(text: &str, width: u16) -> usize {
+    if text == " " {
+        return 1;
+    }
+    let width = usize::from(width.max(1));
+    text.lines()
+        .map(|line| {
+            let mut rows = 1usize;
+            let mut current_width = 0usize;
+            let mut word = String::new();
+            let flush_word = |word: &mut String, rows: &mut usize, current_width: &mut usize| {
+                if word.is_empty() {
+                    return;
+                }
+                let word_width = word.chars().map(display_width).sum::<usize>();
+                if word_width > width {
+                    if *current_width > 0 {
+                        *rows += 1;
+                    }
+                    *rows += word_width.div_ceil(width).saturating_sub(1);
+                    let remainder = word_width % width;
+                    *current_width = if remainder == 0 { width } else { remainder };
+                } else if *current_width > 0 && *current_width + word_width > width {
+                    *rows += 1;
+                    *current_width = word_width;
+                } else {
+                    *current_width += word_width;
+                }
+                word.clear();
+            };
+            for character in line.chars() {
+                if character.is_whitespace() {
+                    flush_word(&mut word, &mut rows, &mut current_width);
+                    let character_width = display_width(character);
+                    if current_width + character_width > width {
+                        rows += 1;
+                        current_width = 0;
+                    } else {
+                        current_width += character_width;
+                    }
+                } else {
+                    word.push(character);
+                }
+            }
+            flush_word(&mut word, &mut rows, &mut current_width);
+            if line.is_empty() {
+                1
+            } else {
+                rows
+            }
+        })
+        .sum::<usize>()
+        .max(1)
+}
+
+fn display_width(character: char) -> usize {
+    if character.is_ascii() {
+        1
+    } else {
+        2
+    }
+}
+
+fn contains_unsafe_display_characters(value: &str) -> bool {
+    value.chars().any(|character| {
+        character.is_control()
+            || matches!(
+                character as u32,
+                0x061C
+                    | 0x200B..=0x200F
+                    | 0x2028..=0x2029
+                    | 0x202A..=0x202E
+                    | 0x2066..=0x2069
+                    | 0xFEFF
+            )
+    })
+}
+
+fn network_status_message(status: &NetworkStatus) -> String {
+    match status {
+        NetworkStatus::Ready => String::from(" "),
+        NetworkStatus::Reduced { capability_command } => {
+            let remediation = capability_command
+                .as_ref()
+                .map(|command| format!(" To enable full traceroute, run: {}", command))
+                .unwrap_or_else(unavailable_remediation);
+            format!(
+                " WARNING: Raw ICMP unavailable; using Datagram mode. Intermediate hops may show ???.\n{}\n Ensure the executable and its parent directories are not writable by unprivileged users.",
+                remediation
+            )
+        }
+        NetworkStatus::Unavailable {
+            details,
+            capability_command,
+        } => {
+            let remediation = capability_command
+                .as_ref()
+                .map(|command| format!(" Run: {}", command))
+                .unwrap_or_else(unavailable_remediation);
+            format!(
+                " ERROR: ICMP probing unavailable: {}.{}\n Ensure the executable and its parent directories are not writable by unprivileged users.",
+                details,
+                remediation
+            )
+        }
+    }
+}
+
+fn unavailable_remediation() -> String {
+    #[cfg(windows)]
+    {
+        String::from(" Check the Windows IP Helper service and firewall policy.")
+    }
+    #[cfg(not(windows))]
+    {
+        String::from(" Run with permission to create raw ICMP sockets.")
+    }
+}
+
+#[cfg(unix)]
+fn detect_network_status() -> NetworkStatus {
+    match ActiveNetworkProber::create_icmp_socket() {
+        Ok((_, SocketKind::Raw)) => NetworkStatus::Ready,
+        Ok((_, SocketKind::Datagram)) => NetworkStatus::Reduced {
+            #[cfg(target_os = "linux")]
+            capability_command: capability_command(),
+            #[cfg(not(target_os = "linux"))]
+            capability_command: None,
+        },
+        Err(error) => NetworkStatus::Unavailable {
+            details: error.to_string(),
+            #[cfg(target_os = "linux")]
+            capability_command: capability_command(),
+            #[cfg(not(target_os = "linux"))]
+            capability_command: None,
+        },
+    }
+}
+
+#[cfg(unix)]
+fn detect_ipv6_network_status() -> NetworkStatus {
+    use socket2::{Domain, Protocol, Socket, Type};
+    match Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::ICMPV6)) {
+        Ok(_) => NetworkStatus::Reduced {
+            capability_command: None,
+        },
+        Err(datagram_error) => match Socket::new(Domain::IPV6, Type::RAW, Some(Protocol::ICMPV6)) {
+            Ok(_) => NetworkStatus::Unavailable {
+                details: String::from(
+                    "ICMPv6 datagram socket unavailable; raw checksum support is required",
+                ),
+                capability_command: None,
+            },
+            Err(raw_error) => NetworkStatus::Unavailable {
+                details: format!("ICMPv6 socket unavailable: {datagram_error}; raw: {raw_error}"),
+                capability_command: None,
+            },
+        },
+    }
+}
+
+#[cfg(windows)]
+fn detect_ipv6_network_status() -> NetworkStatus {
+    NetworkStatus::Unavailable {
+        details: String::from("Windows IPv6 ICMP probing is not implemented"),
+        capability_command: None,
+    }
+}
+
+#[cfg(windows)]
+fn detect_network_status() -> NetworkStatus {
+    windows_network_status()
+}
+
+#[cfg(unix)]
+fn spawn_target_probe(
+    event_transmitter: SyncSender<NetworkEvent>,
+    target_ip: IpAddr,
+    is_paused: Arc<AtomicBool>,
+    should_exit: Arc<AtomicBool>,
+    config: ProbeConfig,
+) -> JoinHandle<()> {
+    match target_ip {
+        IpAddr::V4(address) => {
+            ActiveNetworkProber::spawn(event_transmitter, address, is_paused, should_exit, config)
+        }
+        IpAddr::V6(address) => ActiveIpv6NetworkProber::spawn(
+            event_transmitter,
+            address,
+            is_paused,
+            should_exit,
+            config,
+        ),
+    }
+}
+
+#[cfg(windows)]
+fn spawn_target_probe(
+    event_transmitter: SyncSender<NetworkEvent>,
+    target_ip: IpAddr,
+    is_paused: Arc<AtomicBool>,
+    should_exit: Arc<AtomicBool>,
+    config: ProbeConfig,
+) -> JoinHandle<()> {
+    let address = match target_ip {
+        IpAddr::V4(address) => address,
+        IpAddr::V6(_) => {
+            return thread::spawn(move || {
+                let _ = event_transmitter.send(NetworkEvent::ProbeError {
+                    message: String::from("Windows IPv6 ICMP probing is not implemented"),
+                    suggest_capability: false,
+                });
+            });
+        }
+    };
+    ActiveNetworkProber::spawn(event_transmitter, address, is_paused, should_exit, config)
+}
+
 // ============================================================================
 // 程序入口
 // ============================================================================
 fn main() -> io::Result<()> {
     let args = CliArgs::parse();
+    let config = match ProbeConfig::from_args(&args) {
+        Ok(config) => config,
+        Err(error) => {
+            eprintln!("error: {error}");
+            std::process::exit(2);
+        }
+    };
     let target_host = args.target;
 
-    let target_ipv4 = match BackgroundDnsResolver::resolve_target_host(&target_host) {
+    let target_ip = match BackgroundDnsResolver::resolve_target_host(&target_host, args.ipv6) {
         Ok(ip) => ip,
         Err(error_message) => {
             eprintln!("错误: {}", error_message);
@@ -1019,42 +1736,62 @@ fn main() -> io::Result<()> {
         }
     };
 
-    #[cfg(unix)]
-    if let Err(error) = ActiveNetworkProber::create_icmp_socket() {
-        eprintln!("error: unable to create an ICMP probe socket: {error}");
-        #[cfg(target_os = "linux")]
-        eprintln!("Linux: install libcap and run install.sh to grant cap_net_raw.");
-        #[cfg(target_os = "macos")]
-        eprintln!("macOS: run with permission to create raw ICMP sockets.");
-        return Err(error);
+    #[cfg(windows)]
+    if matches!(target_ip, IpAddr::V6(_)) {
+        eprintln!("error: Windows IPv6 ICMP probing is not implemented yet");
+        std::process::exit(2);
     }
+
+    if config.report {
+        return run_report_mode(target_host, target_ip, config);
+    }
+
+    let network_status = match target_ip {
+        IpAddr::V4(_) => detect_network_status(),
+        IpAddr::V6(_) => detect_ipv6_network_status(),
+    };
 
     let mut terminal_session = TerminalSession::enter()?;
 
-    let (network_tx, network_rx) = mpsc::sync_channel(NETWORK_EVENT_CAPACITY);
+    let event_capacity = NETWORK_EVENT_CAPACITY.max(config.max_hops as usize * 2 + 16);
+    let (network_tx, network_rx) = mpsc::sync_channel(event_capacity);
     let (dns_query_tx, dns_query_rx) = mpsc::channel();
     let (dns_result_tx, dns_result_rx) = mpsc::channel();
 
     let is_paused = Arc::new(AtomicBool::new(false));
     let should_exit = Arc::new(AtomicBool::new(false));
 
-    let network_thread = ActiveNetworkProber::spawn(
-        network_tx,
-        target_ipv4,
-        Arc::clone(&is_paused),
-        Arc::clone(&should_exit),
-    );
+    let network_thread = if matches!(&network_status, NetworkStatus::Unavailable { .. }) {
+        None
+    } else {
+        Some(spawn_target_probe(
+            network_tx,
+            target_ip,
+            Arc::clone(&is_paused),
+            Arc::clone(&should_exit),
+            config.clone(),
+        ))
+    };
 
-    let dns_thread =
-        BackgroundDnsResolver::spawn(dns_query_rx, dns_result_tx, Arc::clone(&should_exit));
+    let dns_thread = if config.no_dns {
+        None
+    } else {
+        Some(BackgroundDnsResolver::spawn(
+            dns_query_rx,
+            dns_result_tx,
+            Arc::clone(&should_exit),
+        ))
+    };
 
     let mut application = MtrApplication::new(
         target_host,
-        target_ipv4,
+        target_ip,
         network_rx,
         dns_query_tx.clone(),
         dns_result_rx,
         is_paused,
+        network_status,
+        config.clone(),
     );
 
     let refresh_interval = Duration::from_millis(100);
@@ -1081,6 +1818,7 @@ fn main() -> io::Result<()> {
                         }
                         KeyCode::Char('p') => application.toggle_pause(),
                         KeyCode::Char('r') => application.reset_all_statistics(),
+                        KeyCode::Char('n') => application.toggle_dns(),
                         _ => {}
                     }
                 }
@@ -1098,9 +1836,193 @@ fn main() -> io::Result<()> {
     drop(application);
     drop(dns_query_tx);
     drop(terminal_session);
-    let _ = network_thread.join();
-    let _ = dns_thread.join();
+    if let Some(network_thread) = network_thread {
+        network_thread
+            .join()
+            .map_err(|_| io::Error::other("network probe thread panicked"))?;
+    }
+    if let Some(dns_thread) = dns_thread {
+        let _ = dns_thread.join();
+    }
 
+    Ok(())
+}
+
+fn run_report_mode(target_host: String, target_ip: IpAddr, config: ProbeConfig) -> io::Result<()> {
+    let network_status = match target_ip {
+        IpAddr::V4(_) => detect_network_status(),
+        IpAddr::V6(_) => detect_ipv6_network_status(),
+    };
+
+    if let NetworkStatus::Unavailable { .. } = &network_status {
+        eprintln!("{}", network_status_message(&network_status));
+        return Err(io::Error::other(
+            "ICMP probing is unavailable; cannot run report mode",
+        ));
+    }
+    if matches!(&network_status, NetworkStatus::Reduced { .. }) {
+        eprintln!("{}", network_status_message(&network_status));
+    }
+
+    let event_capacity = NETWORK_EVENT_CAPACITY.max(config.max_hops as usize * 2 + 16);
+    let (network_tx, network_rx) = mpsc::sync_channel(event_capacity);
+    let (dns_query_tx, dns_query_rx) = mpsc::channel();
+    let (dns_result_tx, dns_result_rx) = mpsc::channel();
+    let is_paused = Arc::new(AtomicBool::new(false));
+    let should_exit = Arc::new(AtomicBool::new(false));
+    let network_thread = spawn_target_probe(
+        network_tx,
+        target_ip,
+        Arc::clone(&is_paused),
+        Arc::clone(&should_exit),
+        config.clone(),
+    );
+    let dns_thread = if config.no_dns {
+        None
+    } else {
+        Some(BackgroundDnsResolver::spawn(
+            dns_query_rx,
+            dns_result_tx,
+            Arc::clone(&should_exit),
+        ))
+    };
+    let mut application = MtrApplication::new(
+        target_host,
+        target_ip,
+        network_rx,
+        dns_query_tx.clone(),
+        dns_result_rx,
+        is_paused,
+        network_status,
+        config.clone(),
+    );
+
+    while application.completed_cycles < config.report_cycles {
+        thread::sleep(Duration::from_millis(50));
+        application.dispatch_incoming_events();
+        if application.completed_cycles < config.report_cycles && network_thread.is_finished() {
+            thread::sleep(Duration::from_millis(20));
+            application.dispatch_incoming_events();
+            if application.completed_cycles < config.report_cycles {
+                should_exit.store(true, Ordering::Relaxed);
+                if !matches!(&application.network_status, NetworkStatus::Ready) {
+                    eprintln!("{}", network_status_message(&application.network_status));
+                }
+                drop(application);
+                drop(dns_query_tx);
+                let join_result = network_thread.join();
+                if let Some(dns_thread) = dns_thread {
+                    let _ = dns_thread.join();
+                }
+                return Err(match join_result {
+                    Ok(()) => io::Error::other(
+                        "probe thread exited before completing the requested cycles",
+                    ),
+                    Err(_) => io::Error::other(
+                        "probe thread panicked before completing the requested cycles",
+                    ),
+                });
+            }
+        }
+    }
+
+    while !network_thread.is_finished() {
+        application.dispatch_incoming_events();
+        thread::sleep(Duration::from_millis(20));
+    }
+    network_thread
+        .join()
+        .map_err(|_| io::Error::other("network probe thread panicked"))?;
+    application.dispatch_incoming_events();
+    let dns_deadline = Instant::now() + Duration::from_secs(2);
+    while !application.in_flight_dns_queries.is_empty() && Instant::now() < dns_deadline {
+        thread::sleep(Duration::from_millis(20));
+        application.dispatch_incoming_events();
+    }
+    if application
+        .route_hops
+        .iter()
+        .all(|hop| hop.ip_address.is_none())
+    {
+        should_exit.store(true, Ordering::Relaxed);
+        eprintln!(
+            "no probe results were recorded; check network connectivity and ICMP permissions"
+        );
+        drop(application);
+        drop(dns_query_tx);
+        if let Some(dns_thread) = dns_thread {
+            let _ = dns_thread.join();
+        }
+        return Err(io::Error::other("no probe results were recorded"));
+    }
+    let report_result = print_report(&application);
+    should_exit.store(true, Ordering::Relaxed);
+    drop(application);
+    drop(dns_query_tx);
+    if let Some(dns_thread) = dns_thread {
+        let _ = dns_thread.join();
+    }
+    match report_result {
+        Err(error) if error.kind() == io::ErrorKind::BrokenPipe => Ok(()),
+        result => result,
+    }
+}
+
+fn print_report(application: &MtrApplication) -> io::Result<()> {
+    let stdout = io::stdout();
+    let mut output = stdout.lock();
+    writeln!(
+        output,
+        "Start: {} ({} -> {})",
+        application.started_at.format("%Y-%m-%dT%H:%M:%S"),
+        application.target_hostname,
+        application.target_ip
+    )?;
+    writeln!(
+        output,
+        "    {:<32} {:>6} {:>5} {:>5} {:>5} {:>5} {:>5} {:>5}",
+        "HOST", "Loss%", "Snt", "Last", "Avg", "Best", "Wrst", "StDev"
+    )?;
+    for hop in &application.route_hops {
+        let host = hop
+            .ip_address
+            .map(|address| {
+                let ip_string = address.to_string();
+                if application.show_dns {
+                    application
+                        .ip_to_hostname_cache
+                        .get(&address)
+                        .filter(|hostname| hostname.as_str() != ip_string.as_str())
+                        .map(|hostname| format!("{} ({})", ip_string, hostname))
+                        .unwrap_or(ip_string)
+                } else {
+                    ip_string
+                }
+            })
+            .unwrap_or_else(|| "???".to_string());
+        let format_latency = |value: Option<f64>| {
+            value
+                .map(|number| format!("{:>5.1}", number))
+                .unwrap_or_else(|| "    -".to_string())
+        };
+        let average = format_latency(hop.average_latency_ms());
+        let best = format_latency(hop.best_latency_ms);
+        let worst = format_latency(hop.worst_latency_ms);
+        let stdev = format_latency(hop.standard_deviation());
+        writeln!(
+            output,
+            "{:>2}. {:<32} {:>5.1}% {:>5} {} {} {} {} {}",
+            hop.ttl,
+            host,
+            hop.packet_loss_percentage(),
+            hop.packets_sent,
+            format_latency(hop.last_latency_ms),
+            average,
+            best,
+            worst,
+            stdev
+        )?;
+    }
     Ok(())
 }
 
@@ -1117,6 +2039,42 @@ mod tests {
             .map(|chunk| u16::from_be_bytes([chunk[0], chunk[1]]) as u32)
             .fold(0u32, |sum, value| sum.wrapping_add(value));
         assert_eq!((checksum & 0xffff) + (checksum >> 16), 0xffff);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn shell_quote_escapes_single_quotes() {
+        assert_eq!(
+            shell_quote("/tmp/mtr user's binary"),
+            "'/tmp/mtr user'\\''s binary'"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn capability_command_contains_required_capability() {
+        let command = capability_command();
+        assert!(
+            command.is_some_and(|command| { command.starts_with("sudo setcap cap_net_raw+ep ") })
+        );
+    }
+
+    #[test]
+    fn network_status_messages_explain_each_state() {
+        assert_eq!(network_status_message(&NetworkStatus::Ready), " ");
+
+        let reduced = network_status_message(&NetworkStatus::Reduced {
+            capability_command: Some(String::from("sudo setcap cap_net_raw+ep 'mtr'")),
+        });
+        assert!(reduced.contains("Datagram"));
+        assert!(reduced.contains("cap_net_raw"));
+
+        let unavailable = network_status_message(&NetworkStatus::Unavailable {
+            details: String::from("permission denied"),
+            capability_command: Some(String::from("sudo setcap cap_net_raw+ep 'mtr'")),
+        });
+        assert!(unavailable.contains("permission denied"));
+        assert!(unavailable.contains("setcap"));
     }
 
     #[cfg(unix)]
@@ -1174,6 +2132,70 @@ mod tests {
         ));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn parses_ipv6_echo_reply_and_time_exceeded_metadata() {
+        let mut echo_reply = vec![0u8; 48];
+        echo_reply[0] = 0x60;
+        echo_reply[6] = 58;
+        echo_reply[40] = 129;
+        echo_reply[44..46].copy_from_slice(&42u16.to_be_bytes());
+        echo_reply[46..48].copy_from_slice(&7u16.to_be_bytes());
+        let echo_metadata = extract_ipv6_probe_metadata(&echo_reply).expect("IPv6 echo reply");
+        assert!(matches!(
+            echo_metadata.response_type,
+            IcmpResponseType::EchoReply
+        ));
+        assert_eq!(echo_metadata.process_identifier, 42);
+        assert_eq!(echo_metadata.sequence_number, 7);
+
+        let mut time_exceeded = vec![0u8; 96];
+        time_exceeded[0] = 0x60;
+        time_exceeded[6] = 58;
+        time_exceeded[40] = 3;
+        time_exceeded[48] = 0x60;
+        time_exceeded[54] = 58;
+        time_exceeded[88] = 128;
+        time_exceeded[92..94].copy_from_slice(&42u16.to_be_bytes());
+        time_exceeded[94..96].copy_from_slice(&7u16.to_be_bytes());
+        let transit_metadata =
+            extract_ipv6_probe_metadata(&time_exceeded).expect("IPv6 time exceeded");
+        assert!(matches!(
+            transit_metadata.response_type,
+            IcmpResponseType::TimeExceeded
+        ));
+        assert_eq!(transit_metadata.process_identifier, 42);
+        assert_eq!(transit_metadata.sequence_number, 7);
+
+        assert!(extract_ipv6_probe_metadata(&echo_reply[..47]).is_none());
+        echo_reply[41] = 1;
+        assert!(extract_ipv6_probe_metadata(&echo_reply).is_none());
+
+        let mut headerless = vec![0u8; 56];
+        headerless[0] = 3;
+        headerless[1] = 0;
+        headerless[8] = 0x60;
+        headerless[14] = 58;
+        headerless[48] = 128;
+        headerless[52..54].copy_from_slice(&42u16.to_be_bytes());
+        headerless[54..56].copy_from_slice(&7u16.to_be_bytes());
+        assert!(matches!(
+            extract_ipv6_probe_metadata(&headerless)
+                .expect("headerless IPv6 time exceeded")
+                .response_type,
+            IcmpResponseType::TimeExceeded
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn builds_ipv6_echo_request() {
+        let packet = build_ipv6_echo_request(7, 42);
+        assert_eq!(packet[0], 128);
+        assert_eq!(&packet[4..6], &42u16.to_be_bytes());
+        assert_eq!(&packet[6..8], &7u16.to_be_bytes());
+    }
+
     #[test]
     fn calculates_statistics() {
         let mut statistic = HopStatistic::new(1, None);
@@ -1186,5 +2208,42 @@ mod tests {
         assert!((statistic.packet_loss_percentage() - 33.3333).abs() < 0.01);
         assert_eq!(statistic.average_latency_ms(), Some(15.0));
         assert!((statistic.standard_deviation().unwrap() - 7.071).abs() < 0.01);
+    }
+
+    #[test]
+    fn validates_probe_configuration() {
+        let args = CliArgs::parse_from([
+            "mtr",
+            "127.0.0.1",
+            "--report",
+            "--report-cycles",
+            "3",
+            "--interval",
+            "0.8",
+            "--max-hops",
+            "12",
+        ]);
+        let config = ProbeConfig::from_args(&args).expect("valid config");
+        assert!(config.report);
+        assert_eq!(config.report_cycles, 3);
+        assert_eq!(config.max_hops, 12);
+        assert_eq!(config.interval, Duration::from_millis(800));
+    }
+
+    #[test]
+    fn rejects_invalid_interval() {
+        assert!(CliArgs::try_parse_from(["mtr", "127.0.0.1", "--report-cycles", "3"]).is_err());
+
+        let args = CliArgs::parse_from(["mtr", "127.0.0.1", "--interval", "0.01"]);
+        assert!(ProbeConfig::from_args(&args).is_err());
+    }
+
+    #[test]
+    fn resolves_explicit_ipv6_target_by_address_family() {
+        assert_eq!(
+            BackgroundDnsResolver::resolve_target_host("::1", true).unwrap(),
+            IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)
+        );
+        assert!(BackgroundDnsResolver::resolve_target_host("::1", false).is_err());
     }
 }

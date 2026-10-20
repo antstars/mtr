@@ -1,5 +1,7 @@
 # Rust MTR (My Traceroute) 🚀
 
+运行时如果缺少 `cap_net_raw`，TUI 顶部会显示高亮警告，并给出针对当前可执行文件的 `sudo setcap cap_net_raw+ep ...` 命令。程序不会自动执行 `sudo`；降级到 Datagram 模式时，中间跳点可能显示为 `???`，两种 socket 都不可用时则显示错误和修复建议。
+
 一款由 Rust 编写的现代化、高并发终端网络诊断工具。它结合了 `traceroute` 和 `ping` 的功能，提供实时动态的路由节点追踪和网络延迟统计。
 
 本工具针对 Windows 操作系统进行了深度重构与优化，完全弃用传统的 Raw Socket 提权模式，直接调用原生系统底层 API，**彻底解决 Windows 下必须以管理员身份运行的痛点**。
@@ -48,6 +50,21 @@ mtr baidu.com
 # 直接探测 IPv4 地址
 mtr 39.156.66.10
 ```
+
+常用命令行选项：
+
+```bash
+# 运行 10 轮并输出文本报告，不进入 TUI
+mtr --report example.com
+
+# 运行 20 轮、每轮间隔 0.8 秒，最多探测 20 跳
+mtr --report --report-cycles 20 --interval 0.8 --max-hops 20 example.com
+
+# 禁用反向 DNS，仅显示 IP 地址
+mtr --no-dns example.com
+```
+
+`--report-cycles` 必须与 `--report` 一起使用；探测间隔不能小于 0.8 秒（单轮收包超时为 800ms）。当前版本的探测内核仍以 IPv4 ICMP 为主，`--ipv6` 参数仅完成参数互斥校验，IPv6 探测将在后续版本接入。
 
 ### Linux：`sudo` 与 `???` 节点说明
 

@@ -10,11 +10,12 @@
 
 * **跨平台原生发包引擎** ：
   * **Windows** ：直接调用系统底层 `IcmpSendEcho` API 穿透防火墙，普通用户免 `Administrator` 权限即可顺滑运行。
-  * **Unix (Linux/macOS)** ：直连底层 Raw Socket，结合 Linux `cap_net_raw` 最小化特权架构，告别传统且具有提权风险的 SUID 与全局 `sudo` 依赖。
+  * **Unix (Linux/macOS)** ：支持 IPv4 和 IPv6 ICMP 探测；IPv4 优先使用 Raw Socket，并可在权限不足时降级到 Datagram Socket。Linux 使用 `cap_net_raw` 即可授予最小必要权限。
 * **工业级报文溯源 (Sequence Matching)** ：在 Unix 引擎中彻底摒弃概率性启发式匹配。通过对 ICMP Time Exceeded (Type 11) 错误报文进行深度嵌套解包，精准提取内部封装的原始进程 Identifier 与 Sequence Number，在极端高并发与乱序网络下依然保证 100% 准确的节点匹配。
 * **高并发探针模型** ：采用 Scatter-Gather (爆发发送-批量收集) 并发模型，消除遇到“禁 Ping”防火墙节点时的串行阻塞等待，瞬间渲染出完整的网络路由拓扑。
 * **精美 TUI 交互界面** ：基于 `ratatui` 和 `crossterm` 构建，支持 10FPS 丝滑刷新的终端数据表格。启用备用屏幕 (Alternate Screen) 渲染，退出时自动恢复终端原貌，绝不污染命令历史。
 * **智能 DNS 反向解析** ：后台独立线程异步处理 PTR 记录查询，不阻塞发包与界面主循环，自动将 IP 转换为易读的 Hostname。
+* **报告模式** ：支持指定探测轮数、探测间隔和最大跳数，输出适合脚本或终端保存的文本报告。
 
 ## 📦 安装指南
 
@@ -49,6 +50,9 @@ mtr baidu.com
 
 # 直接探测 IPv4 地址
 mtr 39.156.66.10
+
+# 探测 IPv6 地址（Unix 系统）
+mtr --ipv6 2001:4860:4860::8888
 ```
 
 常用命令行选项：
@@ -62,9 +66,12 @@ mtr --report --report-cycles 20 --interval 0.8 --max-hops 20 example.com
 
 # 禁用反向 DNS，仅显示 IP 地址
 mtr --no-dns example.com
+
+# 强制使用 IPv4；IPv4/IPv6 参数不能同时使用
+mtr --ipv4 example.com
 ```
 
-`--report-cycles` 必须与 `--report` 一起使用；探测间隔不能小于 0.8 秒（单轮收包超时为 800ms）。当前版本的探测内核仍以 IPv4 ICMP 为主，`--ipv6` 参数仅完成参数互斥校验，IPv6 探测将在后续版本接入。
+`--report-cycles` 必须与 `--report` 一起使用；探测间隔不能小于 0.8 秒（单轮收包超时为 800ms）。`--ipv6` 要求目标解析为 IPv6 地址，链路本地 IPv6 地址（`fe80::/10`）目前不支持接口作用域。Unix 系统支持 IPv6 探测，Windows 当前仅支持 IPv4 ICMP 探测。
 
 ### Linux：`sudo` 与 `???` 节点说明
 
@@ -100,6 +107,7 @@ getcap ./target/release/mtr
 | ------------------ | ----------------------------------------------------------------------------- |
 | `p`              | **Pause / Resume** ：暂停或恢复网络探测引擎的发包动作。                 |
 | `r`              | **Restart** ：一键重置所有路由节点的 `Snt`、`Loss%`及延迟统计数据。 |
+| `n`              | **DNS** ：切换反向 DNS 名称显示；使用 `--no-dns` 启动时不可用。       |
 | `q`或 `Ctrl+C` | **Quit** ：安全释放系统内核资源，优雅退出程序。                         |
 
 ## 🛠️ 技术架构与设计原则
